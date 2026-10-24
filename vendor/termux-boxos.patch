@@ -1,0 +1,102 @@
+--- a/terminal-emulator/src/main/java/com/termux/terminal/TerminalSession.java
++++ b/terminal-emulator/src/main/java/com/termux/terminal/TerminalSession.java
+@@ -127,12 +127,22 @@
+         mTerminalFileDescriptor = JNI.createSubprocess(mShellPath, mCwd, mArgs, mEnv, processId, rows, columns, cellWidthPixels, cellHeightPixels);
+         mShellPid = processId[0];
+ 
+-        final FileDescriptor terminalFileDescriptorWrapped = wrapFileDescriptor(mTerminalFileDescriptor, mClient);
++        // BoxOS: use the public Android FD API instead of hidden-field reflection.
++        final android.os.ParcelFileDescriptor inputDescriptor;
++        final android.os.ParcelFileDescriptor outputDescriptor;
++        try {
++            inputDescriptor = android.os.ParcelFileDescriptor.fromFd(mTerminalFileDescriptor);
++            outputDescriptor = android.os.ParcelFileDescriptor.fromFd(mTerminalFileDescriptor);
++        } catch (IOException e) {
++            finishIfRunning();
++            JNI.close(mTerminalFileDescriptor);
++            throw new IllegalStateException("Unable to duplicate terminal file descriptor", e);
++        }
+ 
+         new Thread("TermSessionInputReader[pid=" + mShellPid + "]") {
+             @Override
+             public void run() {
+-                try (InputStream termIn = new FileInputStream(terminalFileDescriptorWrapped)) {
++                try (InputStream termIn = new android.os.ParcelFileDescriptor.AutoCloseInputStream(inputDescriptor)) {
+                     final byte[] buffer = new byte[4096];
+                     while (true) {
+                         int read = termIn.read(buffer);
+@@ -150,7 +160,7 @@
+             @Override
+             public void run() {
+                 final byte[] buffer = new byte[4096];
+-                try (FileOutputStream termOut = new FileOutputStream(terminalFileDescriptorWrapped)) {
++                try (FileOutputStream termOut = new android.os.ParcelFileDescriptor.AutoCloseOutputStream(outputDescriptor)) {
+                     while (true) {
+                         int bytesToWrite = mTerminalToProcessIOQueue.read(buffer, true);
+                         if (bytesToWrite == -1) return;
+@@ -311,25 +321,6 @@
+             Logger.logStackTraceWithMessage(mClient, LOG_TAG, "Error getting current directory", e);
+         }
+         return null;
+-    }
+-
+-    private static FileDescriptor wrapFileDescriptor(int fileDescriptor, TerminalSessionClient client) {
+-        FileDescriptor result = new FileDescriptor();
+-        try {
+-            Field descriptorField;
+-            try {
+-                descriptorField = FileDescriptor.class.getDeclaredField("descriptor");
+-            } catch (NoSuchFieldException e) {
+-                // For desktop java:
+-                descriptorField = FileDescriptor.class.getDeclaredField("fd");
+-            }
+-            descriptorField.setAccessible(true);
+-            descriptorField.set(result, fileDescriptor);
+-        } catch (NoSuchFieldException | IllegalAccessException | IllegalArgumentException e) {
+-            Logger.logStackTraceWithMessage(client, LOG_TAG, "Error accessing FileDescriptor#descriptor private field", e);
+-            System.exit(1);
+-        }
+-        return result;
+     }
+ 
+     @SuppressLint("HandlerLeak")
+--- a/terminal-emulator/src/main/jni/termux.c
++++ b/terminal-emulator/src/main/jni/termux.c
+@@ -7,6 +7,7 @@
+ #include <string.h>
+ #include <sys/ioctl.h>
+ #include <sys/wait.h>
++#include <sys/prctl.h>
+ #include <termios.h>
+ #include <unistd.h>
+ 
+@@ -69,6 +70,9 @@
+         *pProcessId = (int) pid;
+         return ptm;
+     } else {
++        // BoxOS: do not leave a tracer running after Android terminates the app.
++        prctl(PR_SET_PDEATHSIG, SIGKILL);
++        if (getppid() == 1) _exit(1);
+         // Clear signals which the Android java process may have blocked:
+         sigset_t signals_to_unblock;
+         sigfillset(&signals_to_unblock);
+--- a/terminal-emulator/src/main/jni/Android.mk
++++ b/terminal-emulator/src/main/jni/Android.mk
+@@ -2,4 +2,5 @@
+ include $(CLEAR_VARS)
+ LOCAL_MODULE:= libtermux
+ LOCAL_SRC_FILES:= termux.c
++LOCAL_LDFLAGS += -Wl,-z,max-page-size=16384
+ include $(BUILD_SHARED_LIBRARY)
+--- a/terminal-emulator/src/main/AndroidManifest.xml
++++ b/terminal-emulator/src/main/AndroidManifest.xml
+@@ -1,2 +1 @@
+-<manifest package="com.termux.terminal">
+-</manifest>
++<manifest />
+--- a/terminal-view/src/main/AndroidManifest.xml
++++ b/terminal-view/src/main/AndroidManifest.xml
+@@ -1,2 +1 @@
+-<manifest package="com.termux.view">
+-</manifest>
++<manifest />

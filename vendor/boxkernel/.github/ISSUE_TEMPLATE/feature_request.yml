@@ -1,0 +1,29 @@
+name: Feature request
+description: Propose a new capability or a missing C-PRoot feature
+title: "[feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What should BoxKernel do? If it exists in C PRoot, name the C option/file.
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: What use case does it unlock? Who benefits?
+    validations:
+      required: true
+
+  - type: textarea
+    id: details
+    attributes:
+      label: Proposed approach
+      description: |
+        Rough implementation sketch — which subsystem (syscall
+        translation, extension, execve, path), what events/syscalls it
+        needs. Optional.

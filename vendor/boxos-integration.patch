@@ -1,0 +1,23 @@
+--- a/build.rs
++++ b/build.rs
+@@ -192,7 +192,7 @@
+             "debuginfo=0",
+             "-C",
+             &format!(
+-                "link-args=-static -nostdlib -Wl,--build-id=none,-z,noexecstack,-Ttext=0x{:x}",
++                "link-args=-static -nostdlib -Wl,--build-id=none,-z,noexecstack,-z,max-page-size=16384,-Ttext=0x{:x}",
+                 text_addr
+             ),
+             "--target",
+--- a/src/tracee/event.rs
++++ b/src/tracee/event.rs
+@@ -403,6 +403,9 @@
+                     | crate::ptrace::ptc::PTRACE_O_TRACEEXEC
+                     | crate::ptrace::ptc::PTRACE_O_TRACECLONE
+                     | crate::ptrace::ptc::PTRACE_O_TRACEEXIT;
++                // BoxOS: tracer death must also terminate all guest descendants.
++                #[cfg(target_os = "android")]
++                let default_ptrace_options = default_ptrace_options | libc::PTRACE_O_EXITKILL;
+ 
+                 if DELIVER_SIGTRAP.load(Ordering::Relaxed) {
+                     // A later bare SIGTRAP is a real signal: deliver as-is.

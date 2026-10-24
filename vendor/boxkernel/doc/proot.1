@@ -1,0 +1,327 @@
+.TH PROOT 1 "" "BoxKernel 5.1.0" "User Commands"
+.SH "NAME"
+proot \- chroot, mount \-\-bind, and binfmt_misc without privilege/setup
+.SH "SYNOPSIS"
+\fBproot\fR [\fIoption\fR] ... [\fIcommand\fR]
+.SH "DESCRIPTION"
+BoxKernel is a user\-space implementation of \fBchroot\fR, \fBmount \-\-bind\fR, and \fBbinfmt_misc\fR.  This means that users don't need any privileges or setup to do things like using an arbitrary directory as the new root file system, making files accessible somewhere else in the filesystem hierarchy, or executing programs built for another CPU architecture transparently through QEMU user\-mode.  Also, developers can use BoxKernel as a generic Linux process instrumentation engine thanks to its extension mechanism.  Technically BoxKernel relies on \fBptrace\fR \(em an unprivileged system call available in every Linux kernel \(em combined with \fBseccomp\fR\-based syscall filtering where the kernel supports it.
+.PP
+BoxKernel is a clean\-room Rust re\-implementation of the Termux fork of PRoot 5.1.0 (\fIhttps://github.com/termux/proot\fR), itself based on proot\-me/PRoot (\fIhttps://github.com/proot-me/PRoot\fR).  It retains the fork features needed to run Linux distributions on Android \(em where there is no root access, SELinux may forbid hard links and binding to low ports, and several system calls are blocked or missing.  The relevant options are \fB\-0\fR/\fB\-i\fR, \fB\-l\fR, \fB\-H\fR, \fB\-p\fR, \fB\-L\fR, \fB\-\-sysvipc\fR, and \fB\-\-kill\-on\-exit\fR; see the Options section.  (The Android\-only \fB\-\-ashmem\-memfd\fR option is not currently implemented.)
+.PP
+The new root file system, a.k.a \fIguest rootfs\fR, typically contains a Linux distribution.  By default BoxKernel confines the execution of programs to the guest rootfs only, however users can use the built\-in mount/bind mechanism to access files and directories from the actual root file system, a.k.a \fIhost rootfs\fR, just as if they were part of the guest rootfs.
+.PP
+When the guest Linux distribution is made for a CPU architecture incompatible with the host one, BoxKernel uses the CPU emulator QEMU user\-mode to execute guest programs transparently.  It's a convenient way to develop, to build, and to validate any guest Linux packages seamlessly on users' computers, just as if they were in a \fInative\fR guest environment.  That way all of the cross\-compilation issues are avoided.
+.PP
+BoxKernel can also \fImix\fR the execution of host programs and the execution of guest programs emulated by QEMU user\-mode.  This is useful to use host equivalents of programs that are missing from the guest rootfs and to speed up build\-time by using cross\-compilation tools or CPU\-independent programs, like interpreters.
+.PP
+It is worth noting that the guest kernel is never involved, regardless of whether QEMU user\-mode is used or not.  Technically, when guest programs perform access to system resources, BoxKernel translates their requests before sending them to the host kernel.  This means that guest programs can use host resources (devices, network, ...) just as if they were "normal" host programs.
+.SH "OPTIONS"
+The command\-line interface is composed of two parts: first BoxKernel's options (optional), then the command to launch (\fB/bin/sh\fR if not specified).  This section describes the options supported by BoxKernel, that is, the first part of its command\-line interface.
+.SS "Regular options"
+.TP
+\fB\-r\fR \fIpath\fR, \fB\-\-rootfs\fR=\fIpath\fR
+Use \fIpath\fR as the new guest root file\-system, default is /.
+The specified path typically contains a Linux distribution where all new programs will be confined.  The default rootfs is / when none is specified, this makes sense when the bind mechanism is used to relocate host files and directories, see the \-b option and the Examples section for details.
+.PP
+It is recommended to use the \-R or \-S options instead.
+
+.TP
+\fB\-b\fR \fIpath\fR, \fB\-\-bind\fR=\fIpath\fR, \fB\-m\fR \fIpath\fR, \fB\-\-mount\fR=\fIpath\fR
+Make the content of \fIpath\fR accessible in the guest rootfs.
+This option makes any file or directory of the host rootfs accessible in the confined environment just as if it were part of the guest rootfs.  By default the host path is bound to the same path in the guest rootfs but users can specify any other location with the syntax: \-b \fIhost_path\fR:\fIguest_location\fR.  If the guest location is a symbolic link, it is dereferenced to ensure the new content is accessible through all the symbolic links that point to the overlaid content.  In most cases this default behavior shouldn't be a problem, although it is possible to explicitly not dereference the guest location by appending it the ! character: \-b \fIhost_path\fR:\fIguest_location!\fR.
+
+.TP
+\fB\-q\fR \fIcommand\fR, \fB\-\-qemu\fR=\fIcommand\fR
+Execute guest programs through QEMU as specified by \fIcommand\fR.
+Each time a guest program is going to be executed, BoxKernel inserts the QEMU user\-mode command in front of the initial request. That way, guest programs actually run on a virtual guest CPU emulated by QEMU user\-mode.  The native execution of host programs is still effective and the whole host rootfs is bound to /host\-rootfs in the guest environment.
+
+.TP
+\fB\-w\fR \fIpath\fR, \fB\-\-pwd\fR=\fIpath\fR, \fB\-\-cwd\fR=\fIpath\fR
+Set the initial working directory to \fIpath\fR.
+Some programs expect to be launched from a given directory but do not perform any chdir by themselves.  This option avoids the need for running a shell and then entering the directory manually.
+
+.TP
+\fB\-\-kill\-on\-exit\fR
+Kill all processes on command exit.
+When the executed command leaves orphaned or detached processes around, proot waits until all processes possibly terminate. This option forces the immediate termination of all tracee processes when the main command exits.
+
+.TP
+\fB\-v\fR \fIvalue\fR, \fB\-\-verbose\fR=\fIvalue\fR
+Set the level of debug information to \fIvalue\fR.
+The higher the integer value is, the more detailed debug information is printed to the standard error stream.  A negative value makes BoxKernel quiet except on fatal errors.
+
+.TP
+\fB\-V\fR, \fB\-\-version\fR, \fB\-\-about\fR
+Print version, copyright, license and contact, then exit.
+
+.TP
+\fB\-h\fR, \fB\-\-help\fR, \fB\-\-usage\fR
+Print the version and the command\-line usage, then exit.
+
+.SS "Extension options"
+.TP
+\fB\-k\fR \fIstring\fR, \fB\-\-kernel\-release\fR=\fIstring\fR
+Make current kernel appear as kernel release \fIstring\fR.
+If a program is run on a kernel older than the one expected by its GNU C library, the following error is reported: "FATAL: kernel too old".  To be able to run such programs, BoxKernel can emulate some of the features that are available in the kernel release specified by \fIstring\fR but that are missing in the current kernel.
+
+.TP
+\fB\-0\fR, \fB\-\-root\-id\fR
+Make current user appear as "root" and fake its privileges.
+Some programs will refuse to work if they are not run with "root" privileges, even if there is no technical reason for that.  This is typically the case with package managers.  This option allows users to bypass this kind of limitation by faking the user/group identity, and by faking the success of some operations like changing the ownership of files, changing the root directory to /, ...  Note that this option is quite limited compared to fakeroot.
+
+.TP
+\fB\-i\fR \fIstring\fR, \fB\-\-change\-id\fR=\fIstring\fR
+Make current user and group appear as \fIstring\fR "uid:gid".
+This option makes the current user and group appear as uid and gid.  Likewise, files actually owned by the current user and group appear as if they were owned by uid and gid instead. Note that the \-0 option is the same as \-i 0:0.
+
+.TP
+\fB\-\-link2symlink\fR, \fB\-l\fR
+Replace hard links with symlinks, pretending they are really hardlinks.
+Emulates hard links with symbolic links when SELinux policies do not allow hard links.
+
+.TP
+\fB\-\-sysvipc\fR
+Handle System V IPC syscalls in proot.
+Handles System V IPC syscalls (shmget, semget, msgget, etc.) syscalls inside proot. IPC is handled inside proot and launching 2 proot instances will lead to 2 different IPC Namespaces.
+
+.TP
+\fB\-H\fR
+Hide files and directories starting with '.proot.' .
+Hides helper files from directory listings (getdents) so that guest programs and wildcard expressions do not see or delete them.  This covers the permission meta files created by \-0/\-i (prefix .proot\-meta\-file.) and the links created by \-l (prefix .proot.l2s.).
+
+.TP
+\fB\-p\fR
+Modify bindings to protected ports to use a higher port number.
+Ports below 1024 cannot be bound on kernels with paranoid networking (Android).  This option adds 1024 to the port number of bind(2)/connect(2)\-like calls on localhost sockets, so a guest program binding port 80 actually binds port 1080.
+
+.TP
+\fB\-L\fR
+Correct the size returned from lstat for symbolic links.
+Bionic's lstat(2) returns misleading sizes for symlinks. Combined with \-l, this makes emulated links report plausible metadata (size, link count, inode) to guest programs.
+
+.SS "Alias options"
+.TP
+\fB\-R\fR \fIpath\fR
+Alias: \-r \fIpath\fR + a couple of recommended \-b.
+Programs isolated in \fIpath\fR, a guest rootfs, might still need to access information about the host system, as it is illustrated in the Examples section of the manual.  These host information are typically: user/group definition, network setup, run\-time information, users' files, ...  On all Linux distributions, they all lie in a couple of host files and directories that are automatically bound by this option:
+.PP
+.IP \[bu] 2
+/etc/host.conf
+.IP \[bu] 2
+/etc/hosts
+.IP \[bu] 2
+/etc/hosts.equiv
+.IP \[bu] 2
+/etc/mtab
+.IP \[bu] 2
+/etc/netgroup
+.IP \[bu] 2
+/etc/networks
+.IP \[bu] 2
+/etc/passwd
+.IP \[bu] 2
+/etc/group
+.IP \[bu] 2
+/etc/nsswitch.conf
+.IP \[bu] 2
+/etc/resolv.conf
+.IP \[bu] 2
+/etc/localtime
+.IP \[bu] 2
+/dev/
+.IP \[bu] 2
+/sys/
+.IP \[bu] 2
+/proc/
+.IP \[bu] 2
+/tmp/
+.IP \[bu] 2
+/run/
+.IP \[bu] 2
+/var/run/dbus/system_bus_socket
+.IP \[bu] 2
+$HOME
+.IP \[bu] 2
+\fIpath\fR (the option argument)
+
+.TP
+\fB\-S\fR \fIpath\fR
+Alias: \-0 \-r \fIpath\fR + a couple of recommended \-b.
+This option is useful to safely create and install packages into the guest rootfs.  It is similar to the \-R option except it enables the \-0 option and binds only the following minimal set of paths to avoid unexpected changes on host files:
+.PP
+.IP \[bu] 2
+/etc/host.conf
+.IP \[bu] 2
+/etc/hosts
+.IP \[bu] 2
+/etc/nsswitch.conf
+.IP \[bu] 2
+/etc/resolv.conf
+.IP \[bu] 2
+/dev/
+.IP \[bu] 2
+/sys/
+.IP \[bu] 2
+/proc/
+.IP \[bu] 2
+/tmp/
+.IP \[bu] 2
+/run/shm
+.IP \[bu] 2
+$HOME
+.IP \[bu] 2
+\fIpath\fR (the option argument)
+
+.SH "EXIT STATUS"
+If an internal error occurs, \fBproot\fR returns a non\-zero exit status,
+otherwise it returns the exit status of the last terminated program.
+When an error has occurred, the only way to know if it comes from the
+last terminated program or from \fBproot\fR itself is to have a look at the
+error message.
+.SH "FILES"
+BoxKernel reads links in \fB/proc/<pid>/fd/\fR to support \fBopenat(2)\fR\-like
+syscalls made by the guest programs.
+.PP
+When the \fB\-l\fR (\fB\-\-link2symlink\fR) option is used, BoxKernel stores emulated
+hard links as symbolic links whose names are prefixed with \fB.l2s.\fR or
+\fB.proot.l2s.\fR inside the guest rootfs.  The \fB\-0\fR/\fB\-i\fR options similarly
+record faked file ownership and permissions in \fB.proot\-meta\-file.*\fR
+meta files.  Pass \fB\-H\fR to hide all of these helper files (anything
+starting with \fB.proot\fR) from directory listings.
+.SH "EXAMPLES"
+In the following examples the directories \fB/mnt/slackware\-8.0\fR and
+\fB/mnt/armslack\-12.2/\fR contain a Linux distribution respectively made for
+x86 CPUs and ARM CPUs.
+.SS "\fBchroot\fR equivalent"
+To execute a command inside a given Linux distribution, just give
+\fBproot\fR the path to the guest rootfs followed by the desired command.
+The example below executes the program \fBcat\fR to print the content of a
+file:
+.PP
+.nf
+    proot \-r /mnt/slackware\-8.0/ cat /etc/motd
+
+    Welcome to Slackware Linux 8.0
+.fi
+.PP
+The default command is \fB/bin/sh\fR when none is specified.  Thus the
+shortest way to confine an interactive shell and all its sub\-programs
+is:
+.PP
+.nf
+    proot \-r /mnt/slackware\-8.0/
+
+    $ cat /etc/motd
+    Welcome to Slackware Linux 8.0
+.fi
+.SS "\fBmount \-\-bind\fR equivalent"
+The bind mechanism enables one to relocate files and directories.  This
+is typically useful to trick programs that perform access to hard\-coded
+locations, like some installation scripts:
+.PP
+.nf
+    proot \-b /tmp/alternate_opt:/opt
+
+    $ cd to/sources
+    $ make install
+    [...]
+    install \-m 755 prog "/opt/bin"
+    [...] # prog is installed in "/tmp/alternate_opt/bin" actually
+.fi
+.SS "\fBchroot\fR + \fBmount \-\-bind\fR + \fBsu\fR equivalent"
+Some programs will not work correctly if they are not run by the "root"
+user, this is typically the case with package managers.  BoxKernel can fake
+the root identity and its privileges when the \fB\-0\fR (zero) option is
+specified:
+.PP
+.nf
+    proot \-r /mnt/slackware\-8.0/ \-0
+
+    # id
+    uid=0(root) gid=0(root) [...]
+.fi
+.PP
+When installing packages it is recommended to use the \fB\-S\fR
+option instead of \fB\-R\fR.  \fB\-S\fR enables \fB\-0\fR and binds only paths
+that are known to not be updated by packages:
+.PP
+.nf
+    proot \-S /mnt/slackware\-8.0/
+
+    # installpkg perl.tgz
+    Installing package perl...
+.fi
+.SS "\fBchroot\fR + \fBmount \-\-bind\fR + \fBbinfmt_misc\fR equivalent"
+BoxKernel uses QEMU user\-mode to execute programs built for a CPU
+architecture incompatible with the host one.  To enable this
+feature users just have to specify which instance of QEMU user\-mode
+they want to use with the option \fB\-q\fR:
+.PP
+.nf
+    proot \-R /mnt/armslack\-12.2/ \-q qemu\-arm
+
+    $ cat /etc/motd
+    Welcome to ARMedSlack Linux 12.2
+.fi
+.PP
+The parameter of the \fB\-q\fR option is actually a whole QEMU user\-mode
+command, for instance to enable its GDB server on port 1234:
+.PP
+.nf
+    proot \-R /mnt/armslack\-12.2/ \-q "qemu\-arm \-g 1234" emacs
+.fi
+.PP
+Host programs can be mixed with emulated guest programs; the host
+rootfs is reachable under \fB/host\-rootfs\fR:
+.PP
+.nf
+    $ file /bin/echo
+    [...] ELF 32\-bit LSB executable, ARM [...]
+    $ /bin/echo 'Hello world!'
+    Hello world!
+    $ /host\-rootfs/bin/echo 'Hello mixed world!'
+    Hello mixed world!
+.fi
+.SS "Running a Linux distribution on Android (Termux)"
+On Android devices, install a guest rootfs with
+\fBproot\-distro\fR (\fIhttps://github.com/termux/proot-distro\fR) and let it pick
+the right option mix, or invoke \fBproot\fR directly:
+.PP
+.nf
+    proot \-0 \-\-link2symlink \-\-sysvipc \-r ~/alpine /bin/sh
+
+    # cat /etc/os\-release | head \-1
+    NAME="Alpine Linux"
+.fi
+.SH "CAVEATS"
+.IP \[bu] 2
+BoxKernel is \fInot\fR a security boundary: it confuses programs, it does not
+confine them.  A guest program can modify or delete every host file
+the invoking user could modify or delete.  Never use BoxKernel to isolate
+untrusted code.
+.IP \[bu] 2
+Tracing each syscall has a performance cost, typically a few percent
+on I/O\-bound workloads and more on syscall\-heavy ones.
+.IP \[bu] 2
+Programs that rely on being setuid, on real \fBchroot(2)\fR, or on kernel
+facilities BoxKernel cannot emulate will misbehave or fail.
+.IP \[bu] 2
+The Android\-only \fB\-\-ashmem\-memfd\fR option of C PRoot is not implemented;
+\fBproot \-\-help\fR always shows the options compiled into the local binary.
+.SH "SEE ALSO"
+.IP \[bu] 2
+\fBproot\-distro\fR \(em Termux wrapper that manages guest rootfs archives:
+\fIhttps://github.com/termux/proot-distro\fR
+.IP \[bu] 2
+BoxKernel sources, book, and issue tracker:
+\fIhttps://github.com/BoxOSLab/BoxKernel\fR
+.IP \[bu] 2
+C reference implementation (Termux fork):
+\fIhttps://github.com/termux/proot\fR
+.IP \[bu] 2
+Upstream project (mostly dormant):
+\fIhttps://github.com/proot\-me/PRoot\fR
+.SH "AUTHORS"
+PRoot was written by Cédric Vincent at STMicroelectronics; the Termux
+fork is maintained by the Termux contributors.  BoxKernel is a clean\-room
+Rust re\-implementation maintained by BoxOSLab.

@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - aarch64-linux-android
+          - x86_64-linux-android
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      # Cross targets have no linker here, so build.rs embeds an empty
+      # loader; that is fine for linting.  On Android, std's thread_local!
+      # expansion trips missing_const_for_thread_local even for `const {}`
+      # initializers, so that lint is left to the Linux jobs.
+      - run: |
+          extra=
+          case "${{ matrix.target }}" in
+            *-android) extra="-A clippy::missing_const_for_thread_local" ;;
+          esac
+          cargo clippy --all-targets --locked --target ${{ matrix.target }} -- -D warnings $extra
+
+  test:
+    name: build & test (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: smoke test
+        run: |
+          ./target/release/proot --version
+          ./target/release/proot -0 /usr/bin/id -u
+          ./target/release/proot -b /etc/hostname /usr/bin/cat /etc/hostname >/dev/null
+
+  android:
+    name: android (${{ matrix.abi }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            target: aarch64-linux-android
+          - abi: x86_64
+            target: x86_64-linux-android
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo install cargo-ndk --locked
+      - name: build
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+        run: |
+          cargo ndk -t ${{ matrix.abi }} -P 24 build --release --locked
+          mkdir -p dist/${{ matrix.abi }}
+          cp target/${{ matrix.target }}/release/proot dist/${{ matrix.abi }}/
+          loader=$(ls -t target/${{ matrix.target }}/release/build/boxkernel-*/out/loader.exe | head -n1)
+          test -s "$loader"
+          cp "$loader" dist/${{ matrix.abi }}/loader
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boxkernel-android-${{ matrix.abi }}
+          path: dist/${{ matrix.abi }}
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2

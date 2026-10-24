@@ -1,0 +1,17 @@
+[book]
+title = "BoxKernel"
+description = "User-space chroot, bind mounts and binfmt_misc — a clean-room Rust rewrite of PRoot"
+authors = ["BoxOSLab"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/BoxOSLab/BoxKernel"
+edit-url-template = "https://github.com/BoxOSLab/BoxKernel/edit/main/docs/{path}"
+
+[output.html.search]
+enable = true
+
+[preprocessor]

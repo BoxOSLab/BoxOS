@@ -1,0 +1,2342 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index d66400c..47299c5 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -23,19 +23,43 @@ jobs:
+       - run: cargo fmt --all -- --check
+ 
+   clippy:
+-    name: clippy
++    name: clippy (${{ matrix.target }})
+     runs-on: ubuntu-latest
++    strategy:
++      fail-fast: false
++      matrix:
++        target:
++          - x86_64-unknown-linux-gnu
++          - aarch64-unknown-linux-gnu
++          - aarch64-linux-android
++          - x86_64-linux-android
+     steps:
+       - uses: actions/checkout@v7
+       - uses: dtolnay/rust-toolchain@stable
+         with:
+           components: clippy
++          targets: ${{ matrix.target }}
+       - uses: Swatinem/rust-cache@v2
+-      - run: cargo clippy --all-targets --locked -- -D warnings
++        with:
++          key: ${{ matrix.target }}
++      # Cross targets have no linker here, so build.rs embeds an empty
++      # loader; that is fine for linting.  On Android, std's thread_local!
++      # expansion trips missing_const_for_thread_local even for `const {}`
++      # initializers, so that lint is left to the Linux jobs.
++      - run: |
++          extra=
++          case "${{ matrix.target }}" in
++            *-android) extra="-A clippy::missing_const_for_thread_local" ;;
++          esac
++          cargo clippy --all-targets --locked --target ${{ matrix.target }} -- -D warnings $extra
+ 
+   test:
+-    name: build & test
+-    runs-on: ubuntu-latest
++    name: build & test (${{ matrix.runner }})
++    runs-on: ${{ matrix.runner }}
++    strategy:
++      fail-fast: false
++      matrix:
++        runner: [ubuntu-latest, ubuntu-24.04-arm]
+     steps:
+       - uses: actions/checkout@v7
+       - uses: dtolnay/rust-toolchain@stable
+@@ -48,6 +72,41 @@ jobs:
+           ./target/release/proot -0 /usr/bin/id -u
+           ./target/release/proot -b /etc/hostname /usr/bin/cat /etc/hostname >/dev/null
+ 
++  android:
++    name: android (${{ matrix.abi }})
++    runs-on: ubuntu-latest
++    strategy:
++      fail-fast: false
++      matrix:
++        include:
++          - abi: arm64-v8a
++            target: aarch64-linux-android
++          - abi: x86_64
++            target: x86_64-linux-android
++    steps:
++      - uses: actions/checkout@v7
++      - uses: dtolnay/rust-toolchain@stable
++        with:
++          targets: ${{ matrix.target }}
++      - uses: Swatinem/rust-cache@v2
++        with:
++          key: ${{ matrix.target }}
++      - run: cargo install cargo-ndk --locked
++      - name: build
++        env:
++          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
++        run: |
++          cargo ndk -t ${{ matrix.abi }} -P 24 build --release --locked
++          mkdir -p dist/${{ matrix.abi }}
++          cp target/${{ matrix.target }}/release/proot dist/${{ matrix.abi }}/
++          loader=$(ls -t target/${{ matrix.target }}/release/build/boxkernel-*/out/loader.exe | head -n1)
++          test -s "$loader"
++          cp "$loader" dist/${{ matrix.abi }}/loader
++      - uses: actions/upload-artifact@v4
++        with:
++          name: boxkernel-android-${{ matrix.abi }}
++          path: dist/${{ matrix.abi }}
++
+   deny:
+     name: cargo-deny
+     runs-on: ubuntu-latest
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index dc9f40e..b7dd3a6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -10,6 +10,26 @@ re-implements ([Termux PRoot 5.1.0](https://github.com/termux/proot)).
+ 
+ ### Added
+ 
++- AArch64 host support, for Linux and Android (Bionic):
++  - per-architecture register layer: `user_pt_regs` through
++    `PTRACE_{GET,SET}REGSET`/`NT_PRSTATUS`, syscall-number rewrites through
++    `NT_ARM_SYSTEM_CALL`, AArch32 (compat) register dumps recognized;
++  - arm64/ARM EABI syscall tables, `AUDIT_ARCH_AARCH64`/`AUDIT_ARCH_ARM`
++    seccomp sections, arm64 load addresses, no red zone, 16-byte stack
++    alignment for the loader;
++  - chained and seccomp-restarted syscalls are re-armed through the
++    register the trap reads its number from (`SYSTRAP_NUM`: rax on x86_64,
++    x8 on arm64), and restoring registers at syscall exit skips arguments
++    that alias the result register (x0);
++  - an aarch64 loader (`openat`-based, `svc #0` syscalls);
++  - Android NDK builds (`aarch64-linux-android`, `x86_64-linux-android`):
++    Bionic `errno`, request/resource integer types and missing libc
++    constants are handled;
++  - CI runs the test suite on a native arm64 runner and builds both
++    Android ABIs.
++- `-L` also fixes symlink sizes reported by `newfstatat(…,
++  AT_SYMLINK_NOFOLLOW)` and `statx(…, AT_SYMLINK_NOFOLLOW)`, which is how
++  `lstat()` reaches the kernel on arm64 and with current C libraries.
+ - Complete open-source documentation system:
+   - `README.md` with feature overview, quick start, and badges
+   - mdBook documentation site under `docs/` (user guide, CLI reference,
+@@ -25,6 +45,8 @@ re-implements ([Termux PRoot 5.1.0](https://github.com/termux/proot)).
+ ### Changed
+ 
+ - Expanded crate-level and module-level rustdoc coverage.
++- Tests that poked x86 register fields directly go through
++  architecture-neutral helpers and run on both hosts.
+ 
+ ## [5.1.0] — clean-room Rust rewrite of PRoot 5.1.0
+ 
+diff --git a/README.md b/README.md
+index 8560aee..c8373b7 100644
+--- a/README.md
++++ b/README.md
+@@ -100,7 +100,7 @@ The rendered book is published to GitHub Pages by the
+ 
+ ## Building
+ 
+-Requirements: Linux, Rust **1.85+** (pinned by
++Requirements: Linux or Android on x86_64 or aarch64, Rust **1.85+** (pinned by
+ [`rust-toolchain.toml`](rust-toolchain.toml)), and a C toolchain is
+ *not* needed — the only crate dependency is `libc`.
+ 
+diff --git a/build.rs b/build.rs
+index af78512..f2fc324 100644
+--- a/build.rs
++++ b/build.rs
+@@ -148,18 +148,31 @@ fn build_loader(manifest_dir: &Path, out_dir: &Path) {
+ 
+     // Only the host-arch loader is required for the main binary; the optional
+     // 32-bit variant is built when the toolchain supports it.
+-    let (text_addr, rustc_target): (u64, &str) = match target_arch.as_str() {
++    let (text_addr, gnu_target): (u64, &str) = match target_arch.as_str() {
+         "x86_64" => (0x6000_0000_0000, "x86_64-unknown-linux-gnu"),
+         "aarch64" => (0x0020_0000_0000, "aarch64-unknown-linux-gnu"),
+         "arm" => (0x2000_0000, "armv7-unknown-linux-gnueabihf"),
+         "x86" => (0xa000_0000, "i686-unknown-linux-gnu"),
+         _ => panic!("unsupported host architecture for loader: {}", target_arch),
+     };
++    // Android toolchains ship only the `*-linux-android` standard library;
++    // the freestanding loader builds fine against its `core`.
++    let rustc_target = if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
++        env::var("TARGET").expect("TARGET is set for build scripts")
++    } else {
++        gnu_target.to_string()
++    };
++    // Cross builds need the linker Cargo resolved for the target.
++    let linker = env::var("RUSTC_LINKER").ok();
+ 
+     let loader_src = manifest_dir.join("loader/src/main.rs");
+     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+ 
+-    let status = Command::new(&rustc)
++    let mut command = Command::new(&rustc);
++    if let Some(linker) = &linker {
++        command.arg(format!("-Clinker={}", linker));
++    }
++    let status = command
+         .args([
+             "--edition=2024",
+             "--crate-type=bin",
+@@ -183,7 +196,7 @@ fn build_loader(manifest_dir: &Path, out_dir: &Path) {
+                 text_addr
+             ),
+             "--target",
+-            rustc_target,
++            &rustc_target,
+             "-o",
+         ])
+         .arg(&loader_out)
+diff --git a/docs/src/architecture.md b/docs/src/architecture.md
+index e54ad17..46c5bed 100644
+--- a/docs/src/architecture.md
++++ b/docs/src/architecture.md
+@@ -45,7 +45,7 @@ syscall flows through the system.
+ | `src/extension/` | `extension/` | Typed `Event` enum + `AnyExtension` dispatcher + the 8 built-in extensions |
+ | `src/syscall/` (seccomp) | `syscall/seccomp.c` | BPF program building, `seccomp` filter installation, SIGSYS trapping |
+ | `src/sysnum.rs` + `data/sysnums-*.txt` | `syscall/sysnums-*.list` + gen | Per-ABI syscall-number tables, code-generated at build time |
+-| `src/arch.rs` | `arch.h` | Host word size, reg layouts |
++| `src/arch.rs` | `arch.h` | Per-host-architecture constants (x86_64, aarch64): trap size, red zone, load addresses, seccomp audit arches |
+ | `src/sys.rs` | all of libc | **The FFI boundary** — the only module allowed to call libc directly |
+ | `src/note.rs` | `cli/note.c` | `note!`/`verbose!` diagnostics with severity levels |
+ | `src/util.rs` | misc | Small shared helpers |
+@@ -60,7 +60,9 @@ syscall flows through the system.
+    semantics — later SIGTRAPs re-inject so guest handlers see them).
+ 
+ 2. **Enter.** `syscall/enter.rs::translate_sysenter` reads the syscall
+-   number + args via `tracee/reg.rs` (`PTRACE_GETREGS`). The sysnum is
++   number + args via `tracee/reg.rs` (`PTRACE_GETREGS` on x86_64;
++   `PTRACE_GETREGSET`/`NT_PRSTATUS` on aarch64, where a rewritten
++   syscall number goes back through `NT_ARM_SYSTEM_CALL`). The sysnum is
+    decoded ABI-aware (`sysnum.rs` + `data/sysnums-*.txt` for
+    x86_64/x32/i386/arm/arm64/sh4). Extensions get `SysEnterStart`, then
+    the per-syscall translator runs; extensions get `SysEnterEnd`.
+@@ -147,8 +149,10 @@ for the enforced invariants.
+ time (to hand registers/auxv back to the tracer). `loader/` is a
+ `no_std`, position-independent, naked-function crate built as a raw
+ binary and `include_bytes!`'d into the main crate. Its `unsafe` is
+-inherent (assembly syscall stubs) and intentionally isolated from the
+-safe code base.
++inherent (assembly syscall stubs and the final branch, written for
++x86_64 and aarch64; arm64 has no `open(2)`, so the loader uses
++`openat(AT_FDCWD, …)` there) and intentionally isolated from the safe
++code base.
+ 
+ ## Seccomp acceleration
+ 
+diff --git a/docs/src/installation.md b/docs/src/installation.md
+index 9dfdcef..a5d41f6 100644
+--- a/docs/src/installation.md
++++ b/docs/src/installation.md
+@@ -16,10 +16,11 @@ BoxKernel 5.1.0
+ 
+ Requirements:
+ 
+-- **Linux.** BoxKernel instruments `ptrace(2)`, `seccomp`,
+-  `process_vm_readv/writev`, and `/proc/<pid>/fd`. It does not run on
+-  macOS or Windows; Android works the same way it does for the C
+-  implementation (through Termux).
++- **Linux or Android, on x86_64 or aarch64.** BoxKernel instruments
++  `ptrace(2)`, `seccomp`, `process_vm_readv/writev`, and
++  `/proc/<pid>/fd`. It does not run on macOS or Windows. Each host
++  architecture has its own register layout, syscall table, seccomp
++  section and loader; 32-bit hosts are not supported.
+ - **Rust 1.85 or newer.** `rust-toolchain.toml` pins `stable` and pulls
+   in `rustfmt` + `clippy` automatically. Edition 2024 is in use.
+ - Kernel: any reasonably modern Linux. `process_vm_*` (≥ 3.2) is
+@@ -56,10 +57,43 @@ $ proot -b /etc/hostname /bin/cat /etc/hostname
+ $ proot -v 1 /bin/true          # verbose banner, one line
+ ```
+ 
+-## Cross-compiling / Android
++## Cross-compiling
+ 
+-For Android/Termux use the same build inside the Termux Rust package;
+-all Termux-specific options (`-0`, `-l`, `--sysvipc`, `-p`, `-L`,
++The build script compiles the loader with the same `rustc` and the linker
++Cargo resolved for the target, so a cross build only needs the usual
++target setup:
++
++```console
++$ rustup target add aarch64-unknown-linux-gnu
++$ CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
++    cargo build --release --target aarch64-unknown-linux-gnu
++```
++
++If the loader can't be linked (no cross linker), the build still
++succeeds with a warning and an empty embedded loader; such a binary only
++works with `PROOT_LOADER` pointing at a loader built elsewhere.
++
++## Android
++
++Termux can build BoxKernel natively with its Rust package. To build it
++for an app from a desktop, use the NDK through
++[`cargo-ndk`](https://github.com/bbqsrc/cargo-ndk):
++
++```console
++$ rustup target add aarch64-linux-android x86_64-linux-android
++$ cargo ndk -t arm64-v8a -t x86_64 -P 24 build --release
++$ ls target/aarch64-linux-android/release/proot
++$ ls target/aarch64-linux-android/release/build/boxkernel-*/out/loader.exe
++```
++
++Apps targeting Android 10 (API 29) or later cannot execute files from
++their writable data directory, which is where BoxKernel extracts its
++embedded loader by default. Ship the loader next to `proot` in the APK's
++native library directory (for example as `libproot_loader.so`, with
++`extractNativeLibs` enabled) and point `PROOT_LOADER` at it; set
++`PROOT_TMP_DIR` to a writable directory such as the app's cache.
++
++All Termux-specific options (`-0`, `-l`, `--sysvipc`, `-p`, `-L`,
+ `-H`, `--kill-on-exit`) are implemented except `--ashmem-memfd`, which
+ is Android-Bionic-specific and not yet ported — see
+ [Compatibility](compatibility.md).
+diff --git a/loader/src/main.rs b/loader/src/main.rs
+index 8c08722..c99a844 100644
+--- a/loader/src/main.rs
++++ b/loader/src/main.rs
+@@ -134,6 +134,11 @@ mod imp {
+         ret
+     }
+ 
++    #[inline(always)]
++    pub unsafe fn open_rdonly(path: word_t) -> word_t {
++        syscall3(NR_OPEN, path, O_RDONLY, 0)
++    }
++
+     /// Restore the initial stack pointer, clear state flags and rtld_fini,
+     /// then jump to the program entry point.
+     ///
+@@ -151,8 +156,67 @@ mod imp {
+     }
+ }
+ 
+-#[cfg(not(target_arch = "x86_64"))]
+-compile_error!("loader is currently implemented for x86_64 only");
++#[cfg(target_arch = "aarch64")]
++mod imp {
++    use super::*;
++
++    pub const NR_OPENAT: word_t = 56;
++    pub const NR_CLOSE: word_t = 57;
++    pub const NR_MMAP: word_t = 222;
++    pub const NR_MPROTECT: word_t = 226;
++    pub const NR_EXECVE: word_t = 221;
++    pub const NR_EXIT: word_t = 93;
++    pub const NR_PRCTL: word_t = 167;
++
++    const AT_FDCWD: word_t = -100isize as word_t;
++
++    #[inline(always)]
++    pub unsafe fn syscall1(n: word_t, a1: word_t) -> word_t {
++        let ret: word_t;
++        asm!("svc #0", in("x8") n, inlateout("x0") a1 => ret, options(nostack));
++        ret
++    }
++
++    #[inline(always)]
++    pub unsafe fn syscall3(n: word_t, a1: word_t, a2: word_t, a3: word_t) -> word_t {
++        let ret: word_t;
++        asm!("svc #0", in("x8") n, inlateout("x0") a1 => ret, in("x1") a2,
++             in("x2") a3, options(nostack));
++        ret
++    }
++
++    #[inline(always)]
++    pub unsafe fn syscall6(n: word_t, a1: word_t, a2: word_t, a3: word_t,
++                           a4: word_t, a5: word_t, a6: word_t) -> word_t {
++        let ret: word_t;
++        asm!("svc #0", in("x8") n, inlateout("x0") a1 => ret, in("x1") a2,
++             in("x2") a3, in("x3") a4, in("x4") a5, in("x5") a6, options(nostack));
++        ret
++    }
++
++    /// There is no open(2) on arm64; PRoot translates the openat() path.
++    #[inline(always)]
++    pub unsafe fn open_rdonly(path: word_t) -> word_t {
++        syscall6(NR_OPENAT, AT_FDCWD, path, O_RDONLY, 0, 0, 0)
++    }
++
++    /// Restore the initial stack pointer, clear rtld_fini (x0), then jump to
++    /// the program entry point.
++    ///
++    /// # Safety
++    /// Diverges; `stack_pointer` must denote a valid initial stack image.
++    #[unsafe(naked)]
++    pub unsafe extern "C" fn branch(stack_pointer: word_t, destination: word_t) -> ! {
++        core::arch::naked_asm!(
++            "mov sp, x0",
++            "mov x0, xzr",
++            "br x1",
++        )
++    }
++}
++
++#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++compile_error!("loader is implemented for x86_64 and aarch64 only");
+ 
+ use imp::*;
+ 
+@@ -206,7 +270,7 @@ pub unsafe extern "C" fn _start(cursor: word_t) -> ! {
+                         fatal();
+                     }
+                 }
+-                fd = syscall3(NR_OPEN, payload.open.string_address, O_RDONLY, 0);
++                fd = open_rdonly(payload.open.string_address);
+                 if (fd as isize) < 0 {
+                     fatal();
+                 }
+diff --git a/src/arch.rs b/src/arch.rs
+index dc85b7a..ca813cc 100644
+--- a/src/arch.rs
++++ b/src/arch.rs
+@@ -6,33 +6,75 @@
+ use crate::Word;
+ 
+ /// Syscall number PRoot substitutes when it answers a syscall itself
+-/// (`PR_void`).  On x86_64 the avoider is negative so the kernel cancels the
+-/// syscall outright instead of executing it.
++/// (`PR_void`).  The avoider is negative so the kernel cancels the syscall
++/// outright (x86_64: `orig_rax`; aarch64: `NT_ARM_SYSTEM_CALL`) instead of
++/// executing it.
+ pub const SYSCALL_AVOIDER: Word = (-2i64) as Word;
+ 
+-/// Size in bytes of the instruction that triggers a syscall-stop
+-/// (`syscall`/`sysenter` on x86).
+-pub const SYSTRAP_SIZE: Word = 2;
++#[cfg(target_arch = "x86_64")]
++mod host {
++    /// Size in bytes of the instruction that triggers a syscall-stop
++    /// (`syscall`/`sysenter` on x86).
++    pub const SYSTRAP_SIZE: crate::Word = 2;
+ 
+-/// Bytes below the stack pointer a leaf function may legally use; PRoot must
+-/// not scribble there when allocating tracee memory during sysenter.
+-pub const RED_ZONE_SIZE: Word = 128;
++    /// Bytes below the stack pointer a leaf function may legally use; PRoot
++    /// must not scribble there when allocating tracee memory during sysenter.
++    pub const RED_ZONE_SIZE: crate::Word = 128;
+ 
+-/// Fixed text address the loader ELF is linked at.
+-pub const LOADER_ADDRESS: u64 = 0x6000_0000_0000;
++    /// Fixed text address the loader ELF is linked at.
++    pub const LOADER_ADDRESS: u64 = 0x6000_0000_0000;
+ 
+-/// Load base for position-independent guest executables.
+-pub const EXEC_PIC_ADDRESS: u64 = 0x5000_0000_0000;
++    /// Load base for position-independent guest executables.
++    pub const EXEC_PIC_ADDRESS: u64 = 0x5000_0000_0000;
+ 
+-/// Load base for position-independent ELF interpreters.
+-pub const INTERP_PIC_ADDRESS: u64 = 0x6f00_0000_0000;
++    /// Load base for position-independent ELF interpreters.
++    pub const INTERP_PIC_ADDRESS: u64 = 0x6f00_0000_0000;
+ 
+-/// 32-bit counterparts used by the optional -m32 loader.
+-pub const EXEC_PIC_ADDRESS_32: u64 = 0x0f00_0000;
+-pub const INTERP_PIC_ADDRESS_32: u64 = 0xaf00_0000;
++    /// 32-bit counterparts used by the optional -m32 loader.
++    pub const EXEC_PIC_ADDRESS_32: u64 = 0x0f00_0000;
++    pub const INTERP_PIC_ADDRESS_32: u64 = 0xaf00_0000;
+ 
+-/// e_machine values treated as "host" binaries under QEMU.
+-pub const HOST_ELF_MACHINE: &[u16] = &[62, 3, 6];
++    /// e_machine values treated as "host" binaries under QEMU.
++    pub const HOST_ELF_MACHINE: &[u16] = &[62, 3, 6];
++
++    /// Minimum alignment of the stack pointer the loader is started with;
++    /// a guest word (4 or 8 bytes) is enough on x86.
++    pub const STACK_ALIGNMENT: crate::Word = 4;
++}
++
++#[cfg(target_arch = "aarch64")]
++mod host {
++    /// `svc #0` is one 32-bit instruction.
++    pub const SYSTRAP_SIZE: crate::Word = 4;
++
++    /// AAPCS64 has no red zone.
++    pub const RED_ZONE_SIZE: crate::Word = 0;
++
++    /// Fixed text address the loader ELF is linked at (fits a 39-bit VA
++    /// space, the smallest one Android kernels ship with).
++    pub const LOADER_ADDRESS: u64 = 0x20_0000_0000;
++
++    /// Load base for position-independent guest executables.
++    pub const EXEC_PIC_ADDRESS: u64 = 0x30_0000_0000;
++
++    /// Load base for position-independent ELF interpreters.
++    pub const INTERP_PIC_ADDRESS: u64 = 0x3f_0000_0000;
++
++    /// 32-bit (AArch32) counterparts.
++    pub const EXEC_PIC_ADDRESS_32: u64 = 0x0f00_0000;
++    pub const INTERP_PIC_ADDRESS_32: u64 = 0x1f00_0000;
++
++    /// e_machine values treated as "host" binaries under QEMU (EM_AARCH64).
++    pub const HOST_ELF_MACHINE: &[u16] = &[183];
++
++    /// SP must stay 16-byte aligned: Linux enables EL0 stack alignment checks.
++    pub const STACK_ALIGNMENT: crate::Word = 16;
++}
++
++#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++compile_error!("BoxKernel supports x86_64 and aarch64 hosts only");
++
++pub use host::*;
+ 
+ /// AUDIT_ARCH_* tokens used in the seccomp filter, paired with the ABIs each
+ /// section covers.
+@@ -42,6 +84,7 @@ pub struct SeccompArch {
+     pub abis: &'static [crate::sysnum::Abi],
+ }
+ 
++#[cfg(target_arch = "x86_64")]
+ pub const SECCOMP_ARCHS: &[SeccompArch] = &[
+     SeccompArch {
+         value: AUDIT_ARCH_X86_64,
+@@ -53,8 +96,22 @@ pub const SECCOMP_ARCHS: &[SeccompArch] = &[
+     },
+ ];
+ 
+-pub const AUDIT_ARCH_I386: u32 = 0x4000_0003; // EM_386 | __AUDIT_ARCH_LE|64? no: 0x40000000|3
++#[cfg(target_arch = "aarch64")]
++pub const SECCOMP_ARCHS: &[SeccompArch] = &[
++    SeccompArch {
++        value: AUDIT_ARCH_AARCH64,
++        abis: &[crate::sysnum::Abi::Default],
++    },
++    SeccompArch {
++        value: AUDIT_ARCH_ARM,
++        abis: &[crate::sysnum::Abi::Abi2],
++    },
++];
++
++pub const AUDIT_ARCH_I386: u32 = 0x4000_0003; // EM_386 | __AUDIT_ARCH_LE
+ pub const AUDIT_ARCH_X86_64: u32 = 0xC000_003E; // EM_X86_64|__AUDIT_ARCH_64BIT|LE
++pub const AUDIT_ARCH_ARM: u32 = 0x4000_0028; // EM_ARM | __AUDIT_ARCH_LE
++pub const AUDIT_ARCH_AARCH64: u32 = 0xC000_00B7; // EM_AARCH64|__AUDIT_ARCH_64BIT|LE
+ 
+ /// Offsets of st_uid/st_gid inside the *32-bit* `struct stat` layout.
+ pub const OFFSETOF_STAT_UID_32: usize = 24;
+@@ -86,6 +143,7 @@ mod tests {
+     }
+ 
+     #[test]
++    #[cfg(target_arch = "x86_64")]
+     fn audit_arch_tokens() {
+         // EM_386 | __AUDIT_ARCH_LE | __AUDIT_ARCH_64BIT? i386 = LE|3.
+         assert_eq!(AUDIT_ARCH_I386 & 0xFFFF, 3);
+@@ -97,6 +155,7 @@ mod tests {
+     }
+ 
+     #[test]
++    #[cfg(target_arch = "x86_64")]
+     fn host_machines_include_x86() {
+         // EM_X86_64=62, EM_386=3, EM_86=6 — PRoot treats these as native.
+         assert!(HOST_ELF_MACHINE.contains(&62));
+diff --git a/src/execve/exit.rs b/src/execve/exit.rs
+index 7a2d53d..baa017d 100644
+--- a/src/execve/exit.rs
++++ b/src/execve/exit.rs
+@@ -135,8 +135,9 @@ fn transfer_load_script(tracee: &mut Tracee) -> i32 {
+     let string2_size = string2.len() as Word;
+     let string3_size = string3.len() as Word;
+ 
+-    // Align the strings block to a word boundary (16 on aarch64).
+-    let align = w; // x86_64: sizeof_word; aarch64 would be 16
++    // Align the strings block to a word boundary, or to the stricter stack
++    // alignment the host ABI demands (16 bytes on aarch64).
++    let align = w.max(crate::arch::STACK_ALIGNMENT);
+     let padding_size = (stack_pointer - string1_size - string2_size - string3_size) % align;
+     let strings_size = string1_size + string2_size + string3_size + padding_size;
+ 
+@@ -199,10 +200,13 @@ fn transfer_load_script(tracee: &mut Tracee) -> i32 {
+     buffer.extend(std::iter::repeat_n(0, padding_size as usize));
+ 
+     let buffer_size = buffer.len() as Word;
+-    poke_reg(tracee, Reg::StackPointer, stack_pointer - buffer_size);
+-    poke_reg(tracee, Reg::Userarg1, stack_pointer - buffer_size);
++    let script_address = stack_pointer - buffer_size;
++    // The script itself is word-aligned; the loader's stack must also meet
++    // the ABI alignment, so start it just below the script.
++    poke_reg(tracee, Reg::StackPointer, script_address & !(align - 1));
++    poke_reg(tracee, Reg::Userarg1, script_address);
+ 
+-    let status = write_data(tracee, stack_pointer - buffer_size, &buffer);
++    let status = write_data(tracee, script_address, &buffer);
+     if status < 0 {
+         return status;
+     }
+diff --git a/src/extension/fix_symlink_size.rs b/src/extension/fix_symlink_size.rs
+index 42b2d2d..8b16a48 100644
+--- a/src/extension/fix_symlink_size.rs
++++ b/src/extension/fix_symlink_size.rs
+@@ -5,6 +5,10 @@
+ //! on them reports the target-path length, not the apparent file size.
+ //! This extension rewrites st_size to the symlink target length so the
+ //! fake link looks like the real file.
++//!
++//! Besides lstat/lstat64 it covers the forms lstat() takes on the way to
++//! the kernel where those don't exist (arm64) or aren't used by the libc:
++//! `newfstatat(…, AT_SYMLINK_NOFOLLOW)` and `statx(…, AT_SYMLINK_NOFOLLOW)`.
+ 
+ use crate::PATH_MAX;
+ use crate::Word;
+@@ -18,13 +22,44 @@ use crate::tracee::reg::{Reg, RegVersion, get_sysnum, peek_reg};
+ #[derive(Default)]
+ pub struct FixSymlinkSize;
+ 
++/// Where a stat-like syscall keeps its path and its output buffer.
++enum StatCall {
++    /// `struct stat` filled by lstat()/newfstatat().
++    Stat { path: Reg, buf: Reg },
++    /// `struct statx` filled by statx().
++    Statx { path: Reg, buf: Reg },
++}
++
++/// Offset of `stx_size` in `struct statx` (stable kernel ABI).
++const STATX_SIZE_OFFSET: Word = 40;
++
++fn nofollow(tracee: &Tracee, flags: Reg) -> bool {
++    peek_reg(tracee, RegVersion::Original, flags) & libc::AT_SYMLINK_NOFOLLOW as Word != 0
++}
++
+ /// `handle_sysexit_end()` — after a successful lstat on a symlink, set
+ /// `st_size` to the length of its target.
+ fn handle_sysexit_end(tracee: &mut Tracee) -> i32 {
+-    match get_sysnum(tracee, RegVersion::Original) {
+-        Sysnum::lstat | Sysnum::lstat64 => {}
++    let call = match get_sysnum(tracee, RegVersion::Original) {
++        Sysnum::lstat | Sysnum::lstat64 => StatCall::Stat {
++            path: Reg::Sysarg1,
++            buf: Reg::Sysarg2,
++        },
++        // newfstatat(dirfd, path, buf, flags)
++        Sysnum::newfstatat if nofollow(tracee, Reg::Sysarg4) => StatCall::Stat {
++            path: Reg::Sysarg2,
++            buf: Reg::Sysarg3,
++        },
++        // statx(dirfd, path, flags, mask, buf)
++        Sysnum::statx if nofollow(tracee, Reg::Sysarg3) => StatCall::Statx {
++            path: Reg::Sysarg2,
++            buf: Reg::Sysarg5,
++        },
+         _ => return 0,
+-    }
++    };
++    let (sysarg_path, sysarg_buf) = match call {
++        StatCall::Stat { path, buf } | StatCall::Statx { path, buf } => (path, buf),
++    };
+ 
+     // Override only on success.
+     if peek_reg(tracee, RegVersion::Current, Reg::SysargResult) != 0 {
+@@ -37,7 +72,7 @@ fn handle_sysexit_end(tracee: &mut Tracee) -> i32 {
+     let size = read_string(
+         tracee,
+         &mut original,
+-        peek_reg(tracee, RegVersion::Modified, Reg::Sysarg1),
++        peek_reg(tracee, RegVersion::Modified, sysarg_path),
+     );
+     if size < 0 {
+         return size;
+@@ -45,6 +80,10 @@ fn handle_sysexit_end(tracee: &mut Tracee) -> i32 {
+     if size as usize >= PATH_MAX {
+         return -libc::ENAMETOOLONG;
+     }
++    // An empty path (AT_EMPTY_PATH) stat'ed a file descriptor, not a link.
++    if size <= 1 {
++        return 0;
++    }
+     // `size` includes the terminator read_string wrote.
+     let path = std::ffi::CStr::from_bytes_with_nul(&original[..size as usize]).unwrap_or_default();
+ 
+@@ -64,7 +103,18 @@ fn handle_sysexit_end(tracee: &mut Tracee) -> i32 {
+     }
+ 
+     // Overwrite st_size with the target length.
+-    let stat_addr = peek_reg(tracee, RegVersion::Original, Reg::Sysarg2);
++    let stat_addr = peek_reg(tracee, RegVersion::Original, sysarg_buf);
++    if let StatCall::Statx { .. } = call {
++        if write_data(
++            tracee,
++            stat_addr + STATX_SIZE_OFFSET,
++            &(size as u64).to_ne_bytes(),
++        ) < 0
++        {
++            return -libc::EIO;
++        }
++        return 0;
++    }
+     let mut st: libc::stat = crate::sys::zeroed();
+     if read_data(tracee, crate::sys::as_bytes_mut(&mut st), stat_addr) < 0 {
+         return 0;
+@@ -94,6 +144,8 @@ impl FixSymlinkSize {
+ static FILTERED_SYSNUMS: &[(Sysnum, Word)] = &[
+     (Sysnum::lstat, FILTER_SYSEXIT),
+     (Sysnum::lstat64, FILTER_SYSEXIT),
++    (Sysnum::newfstatat, FILTER_SYSEXIT),
++    (Sysnum::statx, FILTER_SYSEXIT),
+ ];
+ 
+ #[cfg(test)]
+@@ -102,49 +154,136 @@ mod tests {
+     use crate::testutil::{Arena, TempDir, fork_child, test_tracee, use_arena_stack};
+     use crate::tracee::reg::{poke_reg, save_current_regs, set_sysnum};
+ 
+-    /// Arm a synthetic successful lstat: path ptr + stat buffer in arena.
+-    fn setup(t: &mut Tracee, arena: &mut Arena, host_path: &[u8], sysnum: Sysnum) -> usize {
++    /// The flavours of lstat() the extension recognizes.
++    #[derive(Copy, Clone)]
++    enum Kind {
++        /// lstat(path, buf) — x86 only, arm64 has no such syscall.
++        #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
++        Lstat,
++        /// newfstatat(AT_FDCWD, path, buf, flags)
++        Fstatat { flags: Word },
++        /// statx(AT_FDCWD, path, flags, mask, buf)
++        Statx { flags: Word },
++    }
++
++    const NOFOLLOW: Word = libc::AT_SYMLINK_NOFOLLOW as Word;
++
++    /// Arm a synthetic successful stat call: path ptr + output buffer in
++    /// the arena.  Returns the buffer offset.
++    fn setup(t: &mut Tracee, arena: &mut Arena, host_path: &[u8], kind: Kind) -> usize {
+         use_arena_stack(t, arena);
+         let poff = 0x800usize;
+         arena.local()[poff..poff + host_path.len()].copy_from_slice(host_path);
+         arena.local()[poff + host_path.len()] = 0;
+         let soff = 0x1000usize;
++        let path = arena.addr() + poff as u64;
++        let buf = arena.addr() + soff as u64;
+         // Current bank holds result=0 + args; snapshot into the banks the
+-        // handler reads: Modified.Sysarg1 (path), Original (sysnum, buf).
+-        poke_reg(t, Reg::Sysarg1, arena.addr() + poff as u64);
+-        poke_reg(t, Reg::Sysarg2, arena.addr() + soff as u64);
+-        set_sysnum(t, sysnum);
++        // handler reads: Modified (path), Original (sysnum, flags, buf).
++        match kind {
++            Kind::Lstat => {
++                set_sysnum(t, Sysnum::lstat);
++                poke_reg(t, Reg::Sysarg1, path);
++                poke_reg(t, Reg::Sysarg2, buf);
++            }
++            Kind::Fstatat { flags } => {
++                set_sysnum(t, Sysnum::newfstatat);
++                poke_reg(t, Reg::Sysarg2, path);
++                poke_reg(t, Reg::Sysarg3, buf);
++                poke_reg(t, Reg::Sysarg4, flags);
++            }
++            Kind::Statx { flags } => {
++                set_sysnum(t, Sysnum::statx);
++                poke_reg(t, Reg::Sysarg2, path);
++                poke_reg(t, Reg::Sysarg3, flags);
++                poke_reg(t, Reg::Sysarg4, 0x7ff); // STATX_BASIC_STATS
++                poke_reg(t, Reg::Sysarg5, buf);
++            }
++        }
++        // The result register may alias Sysarg1 (x0 on arm64): dirfd is
++        // irrelevant to the handler, so set the result last.
+         poke_reg(t, Reg::SysargResult, 0);
+         save_current_regs(t, RegVersion::Modified);
+         save_current_regs(t, RegVersion::Original);
+         soff
+     }
+ 
+-    #[test]
+-    fn lstat_symlink_size_becomes_target_len() {
++    /// A tracee in a temp dir holding `target_file` and a symlink to it.
++    fn link_fixture() -> Option<(TempDir, Arena, Tracee, Vec<u8>, crate::testutil::Child)> {
+         let td = TempDir::new("fixss");
+         td.file("target_file", b"");
+         td.symlink("target_file", "lnk");
+         // Literal path — td.abs() would canonicalize the symlink away.
+         let link = format!("{}/lnk", td.path().display()).into_bytes();
+-        let mut arena = Arena::new(2);
+-        let Some(child) = fork_child(&arena) else {
+-            return;
+-        };
++        let arena = Arena::new(2);
++        let child = fork_child(&arena)?;
+         let mut t = test_tracee(td.path().to_str().unwrap(), &[]);
+         t.pid = child.pid;
+-        // Fake a successful lstat with st_size=9999.
+-        let soff = setup(&mut t, &mut arena, &link, Sysnum::lstat);
++        Some((td, arena, t, link, child))
++    }
++
++    fn write_stat_size(arena: &mut Arena, soff: usize, size: i64) {
+         let mut st: libc::stat = crate::sys::zeroed();
+-        st.st_size = 9999;
++        st.st_size = size;
+         arena.local()[soff..soff + size_of::<libc::stat>()]
+             .copy_from_slice(crate::sys::as_bytes(&st));
++    }
++
++    fn read_stat_size(arena: &Arena, soff: usize) -> i64 {
++        let mut st: libc::stat = crate::sys::zeroed();
++        crate::sys::as_bytes_mut(&mut st)
++            .copy_from_slice(&arena.local()[soff..soff + size_of::<libc::stat>()]);
++        st.st_size
++    }
++
++    #[test]
++    #[cfg(target_arch = "x86_64")]
++    fn lstat_symlink_size_becomes_target_len() {
++        let Some((_td, mut arena, mut t, link, _child)) = link_fixture() else {
++            return;
++        };
++        // Fake a successful lstat with st_size=9999.
++        let soff = setup(&mut t, &mut arena, &link, Kind::Lstat);
++        write_stat_size(&mut arena, soff, 9999);
+         assert_eq!(handle_sysexit_end(&mut t), 0);
+         // st_size now equals strlen("target_file").
+-        let mut st2: libc::stat = crate::sys::zeroed();
+-        crate::sys::as_bytes_mut(&mut st2)
+-            .copy_from_slice(&arena.local()[soff..soff + size_of::<libc::stat>()]);
+-        assert_eq!(st2.st_size, "target_file".len() as i64);
++        assert_eq!(read_stat_size(&arena, soff), "target_file".len() as i64);
++    }
++
++    #[test]
++    fn fstatat_nofollow_symlink_size_becomes_target_len() {
++        let Some((_td, mut arena, mut t, link, _child)) = link_fixture() else {
++            return;
++        };
++        let soff = setup(&mut t, &mut arena, &link, Kind::Fstatat { flags: NOFOLLOW });
++        write_stat_size(&mut arena, soff, 9999);
++        assert_eq!(handle_sysexit_end(&mut t), 0);
++        assert_eq!(read_stat_size(&arena, soff), "target_file".len() as i64);
++    }
++
++    #[test]
++    fn fstatat_following_links_untouched() {
++        let Some((_td, mut arena, mut t, link, _child)) = link_fixture() else {
++            return;
++        };
++        // stat(), not lstat(): the kernel already followed the link.
++        let soff = setup(&mut t, &mut arena, &link, Kind::Fstatat { flags: 0 });
++        write_stat_size(&mut arena, soff, 9999);
++        assert_eq!(handle_sysexit_end(&mut t), 0);
++        assert_eq!(read_stat_size(&arena, soff), 9999);
++    }
++
++    #[test]
++    fn statx_nofollow_symlink_size_becomes_target_len() {
++        let Some((_td, mut arena, mut t, link, _child)) = link_fixture() else {
++            return;
++        };
++        let soff = setup(&mut t, &mut arena, &link, Kind::Statx { flags: NOFOLLOW });
++        let at = soff + STATX_SIZE_OFFSET as usize;
++        arena.local()[at..at + 8].copy_from_slice(&9999u64.to_ne_bytes());
++        assert_eq!(handle_sysexit_end(&mut t), 0);
++        let size = u64::from_ne_bytes(arena.local()[at..at + 8].try_into().unwrap());
++        assert_eq!(size, "target_file".len() as u64);
+     }
+ 
+     #[test]
+@@ -158,23 +297,34 @@ mod tests {
+         };
+         let mut t = test_tracee(td.path().to_str().unwrap(), &[]);
+         t.pid = child.pid;
+-        let soff = setup(&mut t, &mut arena, &real, Sysnum::lstat);
+-        let mut st: libc::stat = crate::sys::zeroed();
+-        st.st_size = 4242;
+-        arena.local()[soff..soff + size_of::<libc::stat>()]
+-            .copy_from_slice(crate::sys::as_bytes(&st));
++        let soff = setup(&mut t, &mut arena, &real, Kind::Fstatat { flags: NOFOLLOW });
++        write_stat_size(&mut arena, soff, 4242);
+         // Regular file -> st_size preserved.
+         assert_eq!(handle_sysexit_end(&mut t), 0);
+-        let mut st2: libc::stat = crate::sys::zeroed();
+-        crate::sys::as_bytes_mut(&mut st2)
+-            .copy_from_slice(&arena.local()[soff..soff + size_of::<libc::stat>()]);
+-        assert_eq!(st2.st_size, 4242);
++        assert_eq!(read_stat_size(&arena, soff), 4242);
+         // Failed syscall (result != 0) -> untouched.
+         poke_reg(&mut t, Reg::SysargResult, (-1i64) as Word);
+         assert_eq!(handle_sysexit_end(&mut t), 0);
+         // Wrong syscall -> untouched.
+-        set_sysnum(&mut t, Sysnum::open);
++        set_sysnum(&mut t, Sysnum::getpid);
+         save_current_regs(&mut t, RegVersion::Original);
+         assert_eq!(handle_sysexit_end(&mut t), 0);
+     }
++
++    #[test]
++    fn empty_path_fd_stat_untouched() {
++        let td = TempDir::new("fixss");
++        let mut arena = Arena::new(2);
++        let Some(child) = fork_child(&arena) else {
++            return;
++        };
++        let mut t = test_tracee(td.path().to_str().unwrap(), &[]);
++        t.pid = child.pid;
++        // fstatat(fd, "", buf, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW).
++        let flags = NOFOLLOW | libc::AT_EMPTY_PATH as Word;
++        let soff = setup(&mut t, &mut arena, b"", Kind::Fstatat { flags });
++        write_stat_size(&mut arena, soff, 77);
++        assert_eq!(handle_sysexit_end(&mut t), 0);
++        assert_eq!(read_stat_size(&arena, soff), 77);
++    }
+ }
+diff --git a/src/extension/hidden_files.rs b/src/extension/hidden_files.rs
+index 783d556..49cf34f 100644
+--- a/src/extension/hidden_files.rs
++++ b/src/extension/hidden_files.rs
+@@ -220,7 +220,7 @@ mod tests {
+         };
+         // Non-getdents syscall -> no-op.
+         arm_getdents(&mut t, arena.addr() + 0x800, 10, fd, 10);
+-        set_sysnum(&mut t, Sysnum::open);
++        set_sysnum(&mut t, Sysnum::getpid);
+         save_current_regs(&mut t, RegVersion::Original);
+         assert_eq!(handle_getdents(&mut t), 0);
+         assert_eq!(peek_reg(&t, RegVersion::Current, Reg::SysargResult), 10);
+diff --git a/src/extension/kompat.rs b/src/extension/kompat.rs
+index 01038b7..d7303dc 100644
+--- a/src/extension/kompat.rs
++++ b/src/extension/kompat.rs
+@@ -889,6 +889,8 @@ fn parse_utsname(config: &mut Config, string: &str) -> i32 {
+         Err(_) => -1,
+     };
+     if status >= 0 {
++        // c_char is i8 on x86_64 but u8 on aarch64.
++        #[allow(clippy::unnecessary_cast)]
+         let field = |f: &[libc::c_char; 65]| f.iter().map(|&c| c as u8).collect::<Vec<u8>>();
+         let mut host = Utsname::default();
+         host.set(0, &field(&host_uts.sysname));
+@@ -1170,7 +1172,7 @@ mod tests {
+     #[test]
+     fn modify_syscall_shifts_args() {
+         let mut t = Tracee::default();
+-        t.regs[RegVersion::Current.idx()].cs = 0x33; // native ABI
++        crate::tracee::reg::set_bank_compat(&mut t, RegVersion::Current, false); // native ABI
+         poke_reg(&mut t, sysarg(1), 0x111);
+         poke_reg(&mut t, sysarg(2), 0x222);
+         let c = mkconfig((3, 0, 0), (5, 0, 0));
+diff --git a/src/extension/link2symlink.rs b/src/extension/link2symlink.rs
+index 45ce754..16fcd99 100644
+--- a/src/extension/link2symlink.rs
++++ b/src/extension/link2symlink.rs
+@@ -833,7 +833,9 @@ fn handle_sysexit_end(tracee: &mut Tracee, config: &mut L2sConfig) -> i32 {
+             let len = final_path.len();
+             final_stat.st_nlink = std::str::from_utf8(&final_path[len - 4..])
+                 .ok()
+-                .and_then(|s| s.parse::<libc::nlink_t>().ok())
++                // st_nlink's width follows the kernel ABI, not nlink_t
++                // (Bionic's x86_64 `struct stat` uses a 64-bit field).
++                .and_then(|s| s.parse().ok())
+                 .unwrap_or(0);
+ 
+             // Get the address of the 'stat' structure.
+diff --git a/src/extension/sysvipc/sem.rs b/src/extension/sysvipc/sem.rs
+index fce2315..dfc88b8 100644
+--- a/src/extension/sysvipc/sem.rs
++++ b/src/extension/sysvipc/sem.rs
+@@ -360,7 +360,8 @@ mod tests {
+         assert_eq!(sem_check(&c, &mut sem, Some(&mut wt)), 1); // keep waiting
+         assert_eq!(wt, b'n');
+         // With IPC_NOWAIT → EAGAIN instead.
+-        let c2 = cfg_with_sops(&[(0, -1, libc::IPC_NOWAIT as i16)]);
++        const IPC_NOWAIT: i16 = 0o4000; // Not exported by libc for Bionic.
++        let c2 = cfg_with_sops(&[(0, -1, IPC_NOWAIT)]);
+         assert_eq!(sem_check(&c2, &mut sem, None), -libc::EAGAIN);
+     }
+ 
+diff --git a/src/extension/sysvipc/shm.rs b/src/extension/sysvipc/shm.rs
+index c776cec..0ff0261 100644
+--- a/src/extension/sysvipc/shm.rs
++++ b/src/extension/sysvipc/shm.rs
+@@ -163,10 +163,7 @@ fn recvmsg_pointers(
+     do_write: bool,
+ ) -> Result<RecvmsgPointers, i32> {
+     let sockaddr_un_len = size_of::<libc::sockaddr_un>() as Word;
+-    #[cfg(target_arch = "x86_64")]
+     let is32 = is_32on64_mode(tracee);
+-    #[cfg(not(target_arch = "x86_64"))]
+-    let is32 = true;
+ 
+     let ptr_len: Word = if is32 { 4 } else { 8 };
+     let buf_end = guest_buf + sockaddr_un_len;
+@@ -824,7 +821,7 @@ pub fn shm_helper_main() -> ! {
+         let mut addr: libc::sockaddr_un = crate::sys::zeroed();
+         addr.sun_family = libc::AF_UNIX as u16;
+         for (dst, src) in addr.sun_path[..p.len()].iter_mut().zip(p.bytes()) {
+-            *dst = src as i8;
++            *dst = src as libc::c_char;
+         }
+         let bound = crate::sys::bind(socket_server_fd, &addr);
+         if bound == 0 {
+diff --git a/src/ptrace/mod.rs b/src/ptrace/mod.rs
+index e19ed1b..c165aa3 100644
+--- a/src/ptrace/mod.rs
++++ b/src/ptrace/mod.rs
+@@ -3,6 +3,7 @@
+ //! Real ptrace can't be nested: when a tracee calls ptrace(), PRoot
+ //! performs the operation itself and projects the result back.
+ 
++#[cfg(target_arch = "x86_64")]
+ pub mod user;
+ pub mod wait;
+ 
+@@ -14,8 +15,10 @@ use crate::tracee::{Seccomp, Tracee, WaitsIn, get_tracee};
+ 
+ /// PTrace request/option constants as `i32` (libc exposes them as `u32`
+ /// on Linux/glibc, while all our bookkeeping is `i32`/`Word`), plus the
+-/// requests libc lacks on this platform. The table mirrors the complete
+-/// request vocabulary even where this port uses only a subset.
++/// requests libc lacks on this platform (Bionic and non-x86 targets miss
++/// the x86 register requests and the PTRACE_SEIZE family, so those are
++/// spelled out numerically). The table mirrors the complete request
++/// vocabulary even where this port uses only a subset.
+ #[allow(dead_code)]
+ pub mod ptc {
+     macro_rules! c {
+@@ -38,17 +41,17 @@ pub mod ptc {
+     c!(PTRACE_SINGLESTEP);
+     c!(PTRACE_ATTACH);
+     c!(PTRACE_DETACH);
+-    c!(PTRACE_GETREGS);
+-    c!(PTRACE_SETREGS);
+-    c!(PTRACE_GETFPREGS);
+-    c!(PTRACE_SETFPREGS);
++    c!(PTRACE_GETREGS = 12);
++    c!(PTRACE_SETREGS = 13);
++    c!(PTRACE_GETFPREGS = 14);
++    c!(PTRACE_SETFPREGS = 15);
+     c!(PTRACE_GETSIGINFO);
+     c!(PTRACE_SETSIGINFO);
+     c!(PTRACE_GETREGSET);
+     c!(PTRACE_SETREGSET);
+-    c!(PTRACE_SEIZE);
+-    c!(PTRACE_INTERRUPT);
+-    c!(PTRACE_LISTEN);
++    c!(PTRACE_SEIZE = 0x4206);
++    c!(PTRACE_INTERRUPT = 0x4207);
++    c!(PTRACE_LISTEN = 0x4208);
+     c!(PTRACE_SYSCALL);
+     c!(PTRACE_SETOPTIONS);
+     c!(PTRACE_GETEVENTMSG);
+@@ -122,6 +125,7 @@ fn ptrace_req(request: Word, pid: i32, addr: usize, data: usize) -> i32 {
+ pub fn translate_ptrace_exit(ptracer: &mut Tracee) -> i32 {
+     let request = peek_reg(ptracer, RegVersion::Original, Reg::Sysarg1);
+     let mut pid = peek_reg(ptracer, RegVersion::Original, Reg::Sysarg2);
++    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+     let mut address = peek_reg(ptracer, RegVersion::Original, Reg::Sysarg3);
+     let data = peek_reg(ptracer, RegVersion::Original, Reg::Sysarg4);
+     let mut forced_signal: i32 = -1;
+@@ -253,6 +257,7 @@ pub fn translate_ptrace_exit(ptracer: &mut Tracee) -> i32 {
+             return 0;
+         }
+         crate::ptrace::ptc::PTRACE_PEEKUSER => {
++            #[cfg(target_arch = "x86_64")]
+             if is_32on64_mode(ptracer) {
+                 address = user::convert_user_offset(address);
+                 if address == Word::MAX {
+@@ -265,6 +270,7 @@ pub fn translate_ptrace_exit(ptracer: &mut Tracee) -> i32 {
+             return peek_data(ptracer, request, ptracee_pid, address, data);
+         }
+         crate::ptrace::ptc::PTRACE_POKEUSER => {
++            #[cfg(target_arch = "x86_64")]
+             if is_32on64_mode(ptracer) {
+                 address = user::convert_user_offset(address);
+                 if address == Word::MAX {
+@@ -325,6 +331,7 @@ pub fn translate_ptrace_exit(ptracer: &mut Tracee) -> i32 {
+             }
+             return 0;
+         }
++        #[cfg(target_arch = "x86_64")]
+         crate::ptrace::ptc::PTRACE_GETREGS => {
+             let mut buffer = vec![0u8; size_of::<libc::user_regs_struct>()];
+             let st = ptrace_req(
+@@ -351,6 +358,7 @@ pub fn translate_ptrace_exit(ptracer: &mut Tracee) -> i32 {
+             };
+             return write_data(ptracer, data, &buffer[..size]);
+         }
++        #[cfg(target_arch = "x86_64")]
+         crate::ptrace::ptc::PTRACE_SETREGS => {
+             let size = if is_32on64_mode(ptracer) {
+                 user::USER32_NB_REGS * 4
+@@ -384,6 +392,7 @@ pub fn translate_ptrace_exit(ptracer: &mut Tracee) -> i32 {
+             }
+             return 0;
+         }
++        #[cfg(target_arch = "x86_64")]
+         crate::ptrace::ptc::PTRACE_GETFPREGS => {
+             let fp_sz = size_of::<libc::user_fpregs_struct>()
+                 .max(user::USER32_NB_FPREGS * 4);
+@@ -406,6 +415,7 @@ pub fn translate_ptrace_exit(ptracer: &mut Tracee) -> i32 {
+             };
+             return write_data(ptracer, data, &buffer[..size]);
+         }
++        #[cfg(target_arch = "x86_64")]
+         crate::ptrace::ptc::PTRACE_SETFPREGS => {
+             if is_32on64_mode(ptracer) {
+                 crate::note!(
+@@ -428,6 +438,7 @@ pub fn translate_ptrace_exit(ptracer: &mut Tracee) -> i32 {
+             }
+             return 0;
+         }
++        #[cfg(target_arch = "x86_64")]
+         25 /* PTRACE_GET_THREAD_AREA */ => {
+             let mut user_desc = [0u8; 16];
+             let st = ptrace_req(
+@@ -441,6 +452,7 @@ pub fn translate_ptrace_exit(ptracer: &mut Tracee) -> i32 {
+             }
+             return write_data(ptracer, data, &user_desc);
+         }
++        #[cfg(target_arch = "x86_64")]
+         26 /* PTRACE_SET_THREAD_AREA */ => {
+             let mut user_desc = [0u8; 16];
+             let st = read_data(ptracer, &mut user_desc, data);
+diff --git a/src/sys.rs b/src/sys.rs
+index 853fcd7..743303a 100644
+--- a/src/sys.rs
++++ b/src/sys.rs
+@@ -13,17 +13,22 @@ use std::os::unix::io::RawFd;
+ // errno
+ // ==================================================================
+ 
++#[cfg(target_os = "android")]
++use libc::__errno as errno_location;
++#[cfg(not(target_os = "android"))]
++use libc::__errno_location as errno_location;
++
+ /// Read the thread-local `errno`.
+ pub(crate) fn errno() -> i32 {
+-    // SAFETY: __errno_location() always returns a valid pointer to the
+-    // thread-local errno.
+-    unsafe { *libc::__errno_location() }
++    // SAFETY: __errno_location() (Bionic: __errno()) always returns a valid
++    // pointer to the thread-local errno.
++    unsafe { *errno_location() }
+ }
+ 
+ /// Write the thread-local `errno`.
+ pub(crate) fn set_errno(value: i32) {
+     // SAFETY: see `errno`.
+-    unsafe { *libc::__errno_location() = value }
++    unsafe { *errno_location() = value }
+ }
+ 
+ /// Reset `errno` to 0 (the pre-syscall convention used throughout).
+@@ -160,7 +165,8 @@ pub(crate) fn prlimit64(
+     let newp = new.map_or(std::ptr::null(), |r| r as *const _);
+     let oldp = old.map_or(std::ptr::null_mut(), |r| r as *mut _);
+     // SAFETY: both pointers are valid or NULL per the prlimit64 contract.
+-    unsafe { libc::prlimit64(pid, resource, newp, oldp) }
++    // Bionic declares the resource as `int`, glibc as `unsigned int`.
++    unsafe { libc::prlimit64(pid, resource as _, newp, oldp) }
+ }
+ 
+ /// `sigaction(signum, act, oldact)`.
+@@ -360,7 +366,8 @@ pub(crate) fn fcntl(fd: RawFd, cmd: i32, arg: i32) -> i32 {
+ pub(crate) fn ioctl_val<T>(fd: RawFd, request: libc::c_ulong, arg: &mut T) -> i32 {
+     // SAFETY: arg is a valid pointer for the request's in/out struct;
+     // callers pass the right struct type for `request`.
+-    unsafe { libc::ioctl(fd, request, arg as *mut T) }
++    // Bionic declares the request as `int`, glibc as `unsigned long`.
++    unsafe { libc::ioctl(fd, request as _, arg as *mut T) }
+ }
+ 
+ /// `stat(path)`, or `Err(errno)`.
+@@ -751,7 +758,8 @@ pub(crate) fn ptrace(request: libc::c_uint, pid: libc::pid_t, addr: usize, data:
+     // and provided by the caller. errno reports failure.
+     unsafe {
+         libc::ptrace(
+-            request,
++            // Bionic declares the request as `int`, glibc as `unsigned int`.
++            request as _,
+             pid,
+             addr as *mut libc::c_void,
+             data as *mut libc::c_void,
+@@ -934,6 +942,8 @@ mod tests {
+     }
+ 
+     #[test]
++    // c_char is i8 on x86_64 but u8 on aarch64.
++    #[allow(clippy::unnecessary_cast)]
+     fn uname_and_clock() {
+         let u = uname().unwrap();
+         let sysname: String = u
+diff --git a/src/syscall/chain.rs b/src/syscall/chain.rs
+index 80963f0..e918683 100644
+--- a/src/syscall/chain.rs
++++ b/src/syscall/chain.rs
+@@ -87,13 +87,13 @@ pub fn chain_next_syscall(tracee: &mut Tracee) {
+             for (i, arg) in syscall.sysargs.iter().enumerate() {
+                 poke_reg(tracee, crate::tracee::reg::sysarg(i + 1), *arg);
+             }
+-            // The re-executed `syscall` instruction takes its number from
+-            // the *result* register (rax on x86_64) — C pokes SYSTRAP_NUM.
++            // The re-executed trap takes its number from SYSTRAP_NUM: the
++            // *result* register on x86_64 (rax), x8 on aarch64.
+             let n = crate::sysnum::detranslate_sysnum(
+                 crate::tracee::reg::get_abi(tracee),
+                 syscall.sysnum,
+             );
+-            poke_reg(tracee, Reg::SysargResult, n);
++            poke_reg(tracee, crate::tracee::reg::SYSTRAP_NUM, n);
+             let ip = peek_reg(tracee, RegVersion::Current, Reg::InstrPointer);
+             poke_reg(
+                 tracee,
+@@ -146,11 +146,13 @@ pub fn restart_current_syscall_as_chained(tracee: &mut Tracee) -> i32 {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use crate::sysnum::{Abi, detranslate_sysnum};
++    use crate::tracee::reg::{SYSTRAP_NUM, set_bank_compat, set_bank_reg};
+ 
+     fn t() -> Tracee {
+         let mut t = Tracee::default();
+         // Give it a sane instruction pointer.
+-        t.regs[RegVersion::Current.idx()].rip = 0x1000;
++        set_bank_reg(&mut t, RegVersion::Current, Reg::InstrPointer, 0x1000);
+         t
+     }
+ 
+@@ -181,17 +183,24 @@ mod tests {
+     #[test]
+     fn chain_next_arms_registers_and_rewinds_ip() {
+         let mut t = t();
+-        t.regs[RegVersion::Original.idx()].cs = 0x33;
+-        t.regs[RegVersion::Current.idx()].cs = 0x33;
++        set_bank_compat(&mut t, RegVersion::Original, false);
++        set_bank_compat(&mut t, RegVersion::Current, false);
+         register_chained_syscall(&mut t, Sysnum::write, [10, 20, 30, 40, 50, 60]);
+         chain_next_syscall(&mut t);
+         let c = RegVersion::Current;
+         assert_eq!(peek_reg(&t, c, Reg::Sysarg1), 10);
+         assert_eq!(peek_reg(&t, c, Reg::Sysarg6), 60);
+-        // x86_64 write == 1, delivered via the result register.
+-        assert_eq!(peek_reg(&t, c, Reg::SysargResult), 1);
++        // The number goes where the trap reads it (rax on x86_64, x8 on
++        // aarch64) without clobbering the arguments.
++        assert_eq!(
++            peek_reg(&t, c, SYSTRAP_NUM),
++            detranslate_sysnum(Abi::Default, Sysnum::write)
++        );
+         // IP stepped back over the syscall instruction.
+-        assert_eq!(peek_reg(&t, c, Reg::InstrPointer), 0x1000 - 2);
++        assert_eq!(
++            peek_reg(&t, c, Reg::InstrPointer),
++            0x1000 - crate::arch::SYSTRAP_SIZE
++        );
+         assert!(!t.restore_original_regs);
+         assert_eq!(t.restart_how, crate::ptrace::ptc::PTRACE_SYSCALL);
+     }
+@@ -228,8 +237,13 @@ mod tests {
+         let o = RegVersion::Original;
+         t.regs[o.idx()] = t.regs[RegVersion::Current.idx()];
+         poke_reg(&mut t, Reg::Sysarg1, 99); // current differs
+-        t.regs[o.idx()].rdi = 7;
+-        t.regs[o.idx()].orig_rax = 0; // read
++        set_bank_reg(&mut t, o, Reg::Sysarg1, 7);
++        set_bank_reg(
++            &mut t,
++            o,
++            Reg::SysargNum,
++            detranslate_sysnum(Abi::Default, Sysnum::read),
++        );
+         assert_eq!(restart_original_syscall(&mut t), 0);
+         let q = t.chain.syscalls.as_ref().unwrap();
+         assert_eq!(q[0].sysnum, Sysnum::read);
+@@ -252,13 +266,13 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn chain_under_i386_abi_detranslates_number() {
++    fn chain_under_compat_abi_detranslates_number() {
+         let mut t = t();
+-        t.regs[RegVersion::Original.idx()].cs = 0x23;
+-        t.regs[RegVersion::Current.idx()].cs = 0x23;
++        set_bank_compat(&mut t, RegVersion::Original, true);
++        set_bank_compat(&mut t, RegVersion::Current, true);
+         register_chained_syscall(&mut t, Sysnum::write, [0; 6]);
+         chain_next_syscall(&mut t);
+-        // i386 write == 4.
+-        assert_eq!(peek_reg(&t, RegVersion::Current, Reg::SysargResult), 4);
++        // i386 and ARM EABI write == 4.
++        assert_eq!(peek_reg(&t, RegVersion::Current, SYSTRAP_NUM), 4);
+     }
+ }
+diff --git a/src/syscall/exit.rs b/src/syscall/exit.rs
+index 751c44f..b23d58e 100644
+--- a/src/syscall/exit.rs
++++ b/src/syscall/exit.rs
+@@ -120,9 +120,13 @@ pub fn translate_syscall_exit(tracee: &mut Tracee) {
+         Sysnum::readlink | Sysnum::readlinkat => readlink_exit(tracee, syscall_result),
+ 
+         Sysnum::uname => {
+-            // 32-bit-on-64 tracees see "i686" — some 32-bit tools are
+-            // confused by "x86_64".
+-            if crate::tracee::reg::get_abi(tracee) != Abi::Abi2 || (syscall_result as i64) < 0 {
++            // 32-bit-on-64 x86 tracees see "i686" — some 32-bit tools are
++            // confused by "x86_64".  (arm64 kernels already report a
++            // 32-bit machine to AArch32 tasks.)
++            if !cfg!(target_arch = "x86_64")
++                || crate::tracee::reg::get_abi(tracee) != Abi::Abi2
++                || (syscall_result as i64) < 0
++            {
+                 Flow::End
+             } else {
+                 let address = peek_reg(tracee, RegVersion::Original, Reg::Sysarg1);
+@@ -747,17 +751,27 @@ mod tests {
+     }
+ 
+     fn set_readlink_regs(t: &mut Tracee, input: Word, output: Word, max: Word) {
++        // readlink(path, buf, size) where it exists, else (arm64)
++        // readlinkat(AT_FDCWD, path, buf, size).
++        let readlink = detranslate_sysnum(get_abi(t), Sysnum::readlink);
++        let (sysnum, path, buf, size) = if readlink != crate::arch::SYSCALL_AVOIDER {
++            (readlink, Reg::Sysarg1, Reg::Sysarg2, Reg::Sysarg3)
++        } else {
++            poke_reg(t, Reg::Sysarg1, libc::AT_FDCWD as Word);
++            (
++                detranslate_sysnum(get_abi(t), Sysnum::readlinkat),
++                Reg::Sysarg2,
++                Reg::Sysarg3,
++                Reg::Sysarg4,
++            )
++        };
+         // Original bank: the syscall + args as the guest issued them.
+-        poke_reg(
+-            t,
+-            Reg::SysargNum,
+-            detranslate_sysnum(get_abi(t), Sysnum::readlink),
+-        );
+-        poke_reg(t, Reg::Sysarg2, output);
+-        poke_reg(t, Reg::Sysarg3, max);
++        poke_reg(t, Reg::SysargNum, sysnum);
++        poke_reg(t, buf, output);
++        poke_reg(t, size, max);
+         t.regs[RegVersion::Original.idx()] = t.regs[RegVersion::Current.idx()];
+-        // Modified bank: arg1 holds the *translated* host path address.
+-        poke_reg(t, Reg::Sysarg1, input);
++        // Modified bank: the path argument holds the *translated* host path.
++        poke_reg(t, path, input);
+         t.regs[RegVersion::Modified.idx()] = t.regs[RegVersion::Current.idx()];
+     }
+ 
+diff --git a/src/syscall/heap.rs b/src/syscall/heap.rs
+index 2de2037..f247ec7 100644
+--- a/src/syscall/heap.rs
++++ b/src/syscall/heap.rs
+@@ -165,8 +165,8 @@ mod tests {
+ 
+     fn t() -> Tracee {
+         let mut t = Tracee::default();
+-        t.regs[RegVersion::Original.idx()].cs = 0x33;
+-        t.regs[RegVersion::Current.idx()].cs = 0x33;
++        crate::tracee::reg::set_bank_compat(&mut t, RegVersion::Original, false);
++        crate::tracee::reg::set_bank_compat(&mut t, RegVersion::Current, false);
+         t
+     }
+ 
+@@ -330,7 +330,7 @@ mod tests {
+         poke_reg(&mut t, Reg::SysargNum, n);
+         crate::tracee::reg::save_current_regs(&mut t, RegVersion::Modified);
+         // Result equals the originally requested brk -> legit, stop emulating.
+-        t.regs[RegVersion::Original.idx()].rdi = 0xDEAD;
++        crate::tracee::reg::set_bank_reg(&mut t, RegVersion::Original, Reg::Sysarg1, 0xDEAD);
+         poke_reg(&mut t, Reg::SysargResult, 0xDEAD);
+         translate_brk_exit(&mut t);
+         assert!(t.heap.borrow().disabled);
+diff --git a/src/syscall/mod.rs b/src/syscall/mod.rs
+index 79ff9e7..f35a395 100644
+--- a/src/syscall/mod.rs
++++ b/src/syscall/mod.rs
+@@ -276,24 +276,30 @@ mod tests {
+ 
+     #[test]
+     fn is_voided_syscall_detection() {
++        use crate::tracee::reg::{set_bank_compat, set_bank_reg};
++        let (c, o, avoider) = (
++            RegVersion::Current,
++            RegVersion::Original,
++            crate::arch::SYSCALL_AVOIDER,
++        );
+         let mut t = Tracee::default();
+         // Current = avoider, Original = a real sysnum -> voided.
+-        t.regs[RegVersion::Current.idx()].orig_rax = crate::arch::SYSCALL_AVOIDER;
+-        t.regs[RegVersion::Original.idx()].orig_rax = 0;
++        set_bank_reg(&mut t, c, Reg::SysargNum, avoider);
++        set_bank_reg(&mut t, o, Reg::SysargNum, 0);
+         assert!(is_voided_syscall(&t, RegVersion::Current));
+         // Both avoider -> not a voided original.
+-        t.regs[RegVersion::Original.idx()].orig_rax = crate::arch::SYSCALL_AVOIDER;
++        set_bank_reg(&mut t, o, Reg::SysargNum, avoider);
+         assert!(!is_voided_syscall(&t, RegVersion::Current));
+         // Real syscall -> not voided.
+         let mut t = Tracee::default();
+-        t.regs[RegVersion::Current.idx()].orig_rax = 0;
+-        t.regs[RegVersion::Original.idx()].orig_rax = 0;
++        set_bank_reg(&mut t, c, Reg::SysargNum, 0);
++        set_bank_reg(&mut t, o, Reg::SysargNum, 0);
+         assert!(!is_voided_syscall(&t, RegVersion::Current));
+         // 32-bit ABI: avoider masked to 32 bits.
+         let mut t = Tracee::default();
+-        t.regs[RegVersion::Current.idx()].cs = 0x23;
+-        t.regs[RegVersion::Current.idx()].orig_rax = crate::arch::SYSCALL_AVOIDER;
+-        t.regs[RegVersion::Original.idx()].orig_rax = 0;
++        set_bank_compat(&mut t, c, true);
++        set_bank_reg(&mut t, c, Reg::SysargNum, avoider);
++        set_bank_reg(&mut t, o, Reg::SysargNum, 0);
+         assert!(is_voided_syscall(&t, RegVersion::Current));
+     }
+ 
+diff --git a/src/syscall/pipe_shadow.rs b/src/syscall/pipe_shadow.rs
+index 6fee93e..11131fd 100644
+--- a/src/syscall/pipe_shadow.rs
++++ b/src/syscall/pipe_shadow.rs
+@@ -16,6 +16,7 @@ const SHADOW_MAX_AGE_MS: i64 = 1000;
+ const SHADOW_TIMER_MS: i64 = 50;
+ const SHADOW_REAP_INTERVAL_MS: i64 = SHADOW_TIMER_MS / 2;
+ const F_GETPIPE_SZ: i32 = 1032;
++const ITIMER_REAL: i32 = 0; // Not exported by libc for Bionic.
+ 
+ #[derive(Copy, Clone)]
+ struct Shadow {
+@@ -59,7 +60,7 @@ fn writer_would_block(fd: i32) -> bool {
+         return false;
+     }
+     let mut buffered: libc::c_int = 0;
+-    if crate::sys::ioctl_val(fd, libc::FIONREAD, &mut buffered) < 0 {
++    if crate::sys::ioctl_val(fd, libc::FIONREAD as libc::c_ulong, &mut buffered) < 0 {
+         return false;
+     }
+     buffered as i64
+@@ -169,7 +170,7 @@ pub fn set_timer(enabled: bool) {
+     if enabled {
+         timer.it_value.tv_usec = SHADOW_TIMER_MS * 1000;
+     }
+-    if crate::sys::setitimer(libc::ITIMER_REAL, &timer) < 0 {
++    if crate::sys::setitimer(ITIMER_REAL, &timer) < 0 {
+         return;
+     }
+     TIMER_ARMED.with(|a| a.set(enabled));
+diff --git a/src/syscall/rlimit.rs b/src/syscall/rlimit.rs
+index 72d5b16..b073dac 100644
+--- a/src/syscall/rlimit.rs
++++ b/src/syscall/rlimit.rs
+@@ -47,7 +47,7 @@ pub fn translate_setrlimit_exit(tracee: &Tracee, is_prlimit: bool) -> i32 {
+         rlim_cur: 0,
+         rlim_max: 0,
+     };
+-    if crate::sys::prlimit64(0, libc::RLIMIT_STACK, None, Some(&mut proot_stack)) < 0 {
++    if crate::sys::prlimit64(0, libc::RLIMIT_STACK as _, None, Some(&mut proot_stack)) < 0 {
+         crate::verbose!(Some(tracee), 1, "can't get stack limit.");
+         return 0; // Not fatal.
+     }
+@@ -57,7 +57,7 @@ pub fn translate_setrlimit_exit(tracee: &Tracee, is_prlimit: bool) -> i32 {
+     }
+     proot_stack.rlim_cur = tracee_stack_limit;
+ 
+-    if crate::sys::prlimit64(0, libc::RLIMIT_STACK, Some(&proot_stack), None) < 0 {
++    if crate::sys::prlimit64(0, libc::RLIMIT_STACK as _, Some(&proot_stack), None) < 0 {
+         crate::verbose!(Some(tracee), 1, "can't set stack limit.");
+         return 0; // Not fatal.
+     }
+@@ -139,7 +139,7 @@ mod tests {
+             rlim_max: 0,
+         };
+         assert_eq!(
+-            crate::sys::prlimit64(0, libc::RLIMIT_STACK, None, Some(&mut rl)),
++            crate::sys::prlimit64(0, libc::RLIMIT_STACK as _, None, Some(&mut rl)),
+             0
+         );
+         rl.rlim_cur
+diff --git a/src/syscall/seccomp.rs b/src/syscall/seccomp.rs
+index 0f78ef4..7d01890 100644
+--- a/src/syscall/seccomp.rs
++++ b/src/syscall/seccomp.rs
+@@ -4,7 +4,7 @@
+ //! PRoot actually translates, letting everything else run untraced.
+ 
+ use crate::Word;
+-use crate::sysnum::{Abi, Sysnum, detranslate_sysnum};
++use crate::sysnum::{Sysnum, detranslate_sysnum};
+ 
+ /// Flags attached to filtered syscalls (readable via PTRACE_GETEVENTMSG).
+ pub const FILTER_SYSEXIT: Word = 0x1;
+@@ -21,9 +21,6 @@ const SECCOMP_RET_KILL: u32 = 0x0000_0000;
+ const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+ const SECCOMP_RET_TRACE: u32 = 0x7ff0_0000;
+ 
+-const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+-const AUDIT_ARCH_I386: u32 = 0x4000_0003;
+-
+ const PR_SET_NO_NEW_PRIVS: i32 = 38;
+ const PR_SET_SECCOMP: i32 = 22;
+ const SECCOMP_MODE_FILTER: u64 = 2;
+@@ -498,18 +495,15 @@ fn add_trace_syscall(prog: &mut Vec<SockFilter>, syscall: Word, flag: Word) {
+ /// for each arch { if arch → for each sysnum → trace }, else allow; kill
+ /// as the final catch-all.
+ fn set_seccomp_filters(sysnums: &[FilteredSysnum]) -> i32 {
+-    // (audit arch, [abis]) — x86_64 hosts trace x86_64+x32 under
++    // (audit arch, [abis]) — e.g. x86_64 hosts trace x86_64+x32 under
+     // AUDIT_ARCH_X86_64, i386 under AUDIT_ARCH_I386.
+-    let archs: &[(u32, &[Abi])] = &[
+-        (AUDIT_ARCH_X86_64, &[Abi::Default, Abi::Abi3]),
+-        (AUDIT_ARCH_I386, &[Abi::Abi2]),
+-    ];
++    let archs = crate::arch::SECCOMP_ARCHS.iter().map(|a| (a.value, a.abis));
+ 
+     let mut prog: Vec<SockFilter> = Vec::new();
+ 
+     for (arch, abis) in archs {
+         let mut nb_traced = 0usize;
+-        for abi in *abis {
++        for abi in abis {
+             for s in sysnums {
+                 if detranslate_sysnum(*abi, s.value) != crate::arch::SYSCALL_AVOIDER {
+                     nb_traced += 1;
+@@ -517,8 +511,8 @@ fn set_seccomp_filters(sysnums: &[FilteredSysnum]) -> i32 {
+             }
+         }
+ 
+-        start_arch_section(&mut prog, *arch, nb_traced);
+-        for abi in *abis {
++        start_arch_section(&mut prog, arch, nb_traced);
++        for abi in abis {
+             for s in sysnums {
+                 let syscall = detranslate_sysnum(*abi, s.value);
+                 if syscall == crate::arch::SYSCALL_AVOIDER {
+@@ -595,10 +589,10 @@ mod tests {
+ 
+     #[test]
+     fn stmt_and_jump_layout() {
+-        let s = stmt(libc::BPF_LD as u16, 42);
+-        assert_eq!((s.code, s.jt, s.jf, s.k), (libc::BPF_LD as u16, 0, 0, 42));
+-        let j = jump(libc::BPF_JMP as u16, 7, 1, 2);
+-        assert_eq!((j.code, j.jt, j.jf, j.k), (libc::BPF_JMP as u16, 1, 2, 7));
++        let s = stmt(BPF_LD, 42);
++        assert_eq!((s.code, s.jt, s.jf, s.k), (BPF_LD, 0, 0, 42));
++        let j = jump(BPF_JMP, 7, 1, 2);
++        assert_eq!((j.code, j.jt, j.jf, j.k), (BPF_JMP, 1, 2, 7));
+         assert_eq!(size_of::<SockFilter>(), 8);
+     }
+ 
+diff --git a/src/sysnum.rs b/src/sysnum.rs
+index dc9fe52..70f1a98 100644
+--- a/src/sysnum.rs
++++ b/src/sysnum.rs
+@@ -23,6 +23,7 @@ struct Sysnums {
+     offset: Word,
+ }
+ 
++#[cfg(target_arch = "x86_64")]
+ fn get_sysnums(abi: Abi) -> Sysnums {
+     match abi {
+         Abi::Default => Sysnums {
+@@ -40,6 +41,21 @@ fn get_sysnums(abi: Abi) -> Sysnums {
+     }
+ }
+ 
++#[cfg(target_arch = "aarch64")]
++fn get_sysnums(abi: Abi) -> Sysnums {
++    match abi {
++        Abi::Default => Sysnums {
++            table: &SYSNUMS_ARM64,
++            offset: 0,
++        },
++        // AArch32 (ARM EABI) compat tasks; there is no third ABI on arm64.
++        Abi::Abi2 | Abi::Abi3 => Sysnums {
++            table: &SYSNUMS_ARM,
++            offset: 0,
++        },
++    }
++}
++
+ /// Translate an architecture-specific syscall number to a neutral `Sysnum`;
+ /// `Sysnum::Void` for out-of-range or unmapped numbers.
+ pub fn translate_sysnum(abi: Abi, sysnum: Word) -> Sysnum {
+@@ -69,7 +85,23 @@ pub fn detranslate_sysnum(abi: Abi, sysnum: Sysnum) -> Word {
+         .unwrap_or(SYSCALL_AVOIDER)
+ }
+ 
+-#[cfg(test)]
++#[cfg(all(test, target_arch = "aarch64"))]
++mod tests_aarch64 {
++    use super::*;
++
++    #[test]
++    fn arm64_known_numbers() {
++        assert_eq!(translate_sysnum(Abi::Default, 56), Sysnum::openat);
++        assert_eq!(translate_sysnum(Abi::Default, 63), Sysnum::read);
++        assert_eq!(translate_sysnum(Abi::Default, 221), Sysnum::execve);
++        assert_eq!(
++            detranslate_sysnum(Abi::Default, Sysnum::open),
++            SYSCALL_AVOIDER
++        );
++    }
++}
++
++#[cfg(all(test, target_arch = "x86_64"))]
+ mod tests {
+     use super::*;
+ 
+diff --git a/src/tracee/event.rs b/src/tracee/event.rs
+index 546f83a..a00fbe8 100644
+--- a/src/tracee/event.rs
++++ b/src/tracee/event.rs
+@@ -1221,8 +1221,8 @@ mod tests {
+         let mut t = test_tracee("/", &[]);
+         poke_reg(&mut t, Reg::SysargNum, Sysnum::clone as Word);
+         // get_sysnum decodes via the ABI table.
+-        t.regs[RegVersion::Current.idx()].orig_rax =
+-            crate::sysnum::detranslate_sysnum(crate::tracee::reg::get_abi(&t), Sysnum::clone);
++        let n = crate::sysnum::detranslate_sysnum(crate::tracee::reg::get_abi(&t), Sysnum::clone);
++        crate::tracee::reg::set_bank_reg(&mut t, RegVersion::Current, Reg::SysargNum, n);
+         poke_reg(&mut t, Reg::Sysarg2, 0xDEAD_0000);
+         assert_eq!(new_child_stack(&mut t), 0xDEAD_0000);
+     }
+@@ -1236,8 +1236,8 @@ mod tests {
+         let args_addr = arena.addr() + 512;
+         crate::tracee::mem::write_data(&t, args_addr + 5 * 8, &0xAAAA_0000u64.to_ne_bytes());
+         crate::tracee::mem::write_data(&t, args_addr + 6 * 8, &0x4000u64.to_ne_bytes());
+-        t.regs[RegVersion::Current.idx()].orig_rax =
+-            crate::sysnum::detranslate_sysnum(crate::tracee::reg::get_abi(&t), Sysnum::clone3);
++        let n = crate::sysnum::detranslate_sysnum(crate::tracee::reg::get_abi(&t), Sysnum::clone3);
++        crate::tracee::reg::set_bank_reg(&mut t, RegVersion::Current, Reg::SysargNum, n);
+         poke_reg(&mut t, Reg::Sysarg1, args_addr);
+         // child stack = clone_args.stack + clone_args.stack_size
+         assert_eq!(new_child_stack(&mut t), 0xAAAA_4000);
+@@ -1246,8 +1246,8 @@ mod tests {
+     #[test]
+     fn new_child_stack_fork_falls_back_to_sp() {
+         let mut t = test_tracee("/", &[]);
+-        t.regs[RegVersion::Current.idx()].orig_rax =
+-            crate::sysnum::detranslate_sysnum(crate::tracee::reg::get_abi(&t), Sysnum::fork);
++        let n = crate::sysnum::detranslate_sysnum(crate::tracee::reg::get_abi(&t), Sysnum::fork);
++        crate::tracee::reg::set_bank_reg(&mut t, RegVersion::Current, Reg::SysargNum, n);
+         poke_reg(&mut t, Reg::StackPointer, 0x7777_8888);
+         assert_eq!(new_child_stack(&mut t), 0x7777_8888);
+     }
+@@ -1347,8 +1347,8 @@ mod tests {
+     #[test]
+     fn resolve_pending_child_ignores_non_fork() {
+         let mut t = test_tracee("/", &[]);
+-        t.regs[RegVersion::Original.idx()].orig_rax =
+-            crate::sysnum::detranslate_sysnum(crate::tracee::reg::get_abi(&t), Sysnum::getpid);
++        let n = crate::sysnum::detranslate_sysnum(crate::tracee::reg::get_abi(&t), Sysnum::getpid);
++        crate::tracee::reg::set_bank_reg(&mut t, RegVersion::Original, Reg::SysargNum, n);
+         t.pending_child = true;
+         resolve_pending_child(&mut t);
+         assert!(t.pending_child); // untouched
+diff --git a/src/tracee/mod.rs b/src/tracee/mod.rs
+index fbc228b..3d241a4 100644
+--- a/src/tracee/mod.rs
++++ b/src/tracee/mod.rs
+@@ -638,8 +638,14 @@ mod tests {
+         assert!(!is_in_sysexit(&t));
+         t.status = 1;
+         assert!(is_in_sysexit(&t));
+-        t.regs[crate::tracee::reg::RegVersion::Original.idx()].orig_rax =
++        let getpid =
+             crate::sysnum::detranslate_sysnum(crate::tracee::reg::get_abi(&t), Sysnum::getpid);
++        crate::tracee::reg::set_bank_reg(
++            &mut t,
++            crate::tracee::reg::RegVersion::Original,
++            crate::tracee::reg::Reg::SysargNum,
++            getpid,
++        );
+         assert!(is_in_sysexit2(&t, Sysnum::getpid));
+         assert!(!is_in_sysexit2(&t, Sysnum::openat));
+     }
+diff --git a/src/tracee/reg.rs b/src/tracee/reg.rs
+index 7b99773..74b924c 100644
+--- a/src/tracee/reg.rs
++++ b/src/tracee/reg.rs
+@@ -6,7 +6,7 @@
+ //! table resolves the ABI currently in use.
+ 
+ use crate::Word;
+-use crate::sysnum::{Abi, Sysnum, detranslate_sysnum, translate_sysnum};
++use crate::sysnum::{Sysnum, detranslate_sysnum, translate_sysnum};
+ use crate::tracee::Tracee;
+ 
+ /// Snapshot selector.
+@@ -47,50 +47,327 @@ pub enum Reg {
+ 
+ pub const NB_REGS: usize = 13;
+ 
+-/// Cached general-purpose registers — `struct user_regs_struct` on x86_64.
+-pub type Regs = libc::user_regs_struct;
++/// Register the syscall instruction reads its number from when PRoot
++/// re-executes it (`SYSTRAP_NUM`): rax on x86_64, where orig_rax is only the
++/// kernel's saved copy; x8 (r7 for AArch32) on aarch64.
++#[cfg(target_arch = "x86_64")]
++pub const SYSTRAP_NUM: Reg = Reg::SysargResult;
++#[cfg(target_arch = "aarch64")]
++pub const SYSTRAP_NUM: Reg = Reg::SysargNum;
++
++#[cfg(target_arch = "x86_64")]
++mod layout {
++    use super::{NB_REGS, RegVersion};
++    use crate::sysnum::Abi;
++    use crate::tracee::Tracee;
++
++    /// Cached general-purpose registers — `struct user_regs_struct` on x86_64.
++    pub type Regs = libc::user_regs_struct;
++
++    /// Field offsets into `user_regs_struct` for the x86_64 ABI.
++    /// (`std::mem::offset_of!` — stable since Rust 1.77.)
++    macro_rules! reg_offset {
++        ($field:ident) => {
++            std::mem::offset_of!(libc::user_regs_struct, $field)
++        };
++    }
++
++    pub(super) const REG_OFFSET_X86_64: [usize; NB_REGS] = [
++        reg_offset!(orig_rax), // SYSARG_NUM
++        reg_offset!(rdi),      // SYSARG_1
++        reg_offset!(rsi),      // SYSARG_2
++        reg_offset!(rdx),      // SYSARG_3
++        reg_offset!(r10),      // SYSARG_4
++        reg_offset!(r8),       // SYSARG_5
++        reg_offset!(r9),       // SYSARG_6
++        reg_offset!(rax),      // SYSARG_RESULT
++        reg_offset!(rsp),      // STACK_POINTER
++        reg_offset!(rip),      // INSTR_POINTER
++        reg_offset!(rdx),      // RTLD_FINI
++        reg_offset!(eflags),   // STATE_FLAGS
++        reg_offset!(rdi),      // USERARG_1
++    ];
++
++    /// Field offsets for the i386 ABI (32-bit syscall convention) as seen in a
++    /// `user_regs_struct` produced by a 64-bit kernel.
++    pub(super) const REG_OFFSET_I386: [usize; NB_REGS] = [
++        reg_offset!(orig_rax),
++        reg_offset!(rbx),
++        reg_offset!(rcx),
++        reg_offset!(rdx),
++        reg_offset!(rsi),
++        reg_offset!(rdi),
++        reg_offset!(rbp),
++        reg_offset!(rax),
++        reg_offset!(rsp),
++        reg_offset!(rip),
++        reg_offset!(rdx),
++        reg_offset!(eflags),
++        reg_offset!(rax),
++    ];
++
++    /// Current ABI of the tracee (`get_abi()`): relies on ORIGINAL regs since an
++    /// ABI change takes effect only when the syscall fully returns.
++    pub fn get_abi(tracee: &Tracee) -> Abi {
++        let cs = tracee.regs[RegVersion::Original.idx()].cs;
++        match cs {
++            0x23 => Abi::Abi2,
++            0x33 => {
++                if tracee.regs[RegVersion::Original.idx()].ds == 0x2B {
++                    Abi::Abi3
++                } else {
++                    Abi::Default
++                }
++            }
++            _ => Abi::Default,
++        }
++    }
++
++    /// Whether the tracee is a 32-bit process (x86 or x32) — CURRENT regs since
++    /// the mode switch is effective immediately.
++    pub fn is_32on64_mode(tracee: &Tracee) -> bool {
++        let cs = tracee.regs[RegVersion::Current.idx()].cs;
++        match cs {
++            0x23 => true,
++            0x33 => tracee.regs[RegVersion::Current.idx()].ds == 0x2B,
++            _ => false,
++        }
++    }
++
++    #[inline]
++    pub(super) fn reg_offsets(tracee: &Tracee, version: RegVersion) -> &'static [usize; NB_REGS] {
++        // i386 register conventions apply when cs == 0x23 for *that* bank.
++        if tracee.regs[version.idx()].cs == 0x23 {
++            &REG_OFFSET_I386
++        } else {
++            &REG_OFFSET_X86_64
++        }
++    }
++
++    /// Every slot of the x86_64 register file is 64 bits wide.
++    #[inline]
++    pub(super) fn reg_width(_regs: &Regs) -> usize {
++        8
++    }
+ 
+-/// Field offsets into `user_regs_struct` for the x86_64 ABI.
+-/// (`std::mem::offset_of!` — stable since Rust 1.77.)
+-macro_rules! reg_offset {
+-    ($field:ident) => {
+-        std::mem::offset_of!(libc::user_regs_struct, $field)
+-    };
++    /// `fetch_regs()` — refresh the CURRENT bank from the kernel.
++    pub fn fetch_regs(tracee: &mut Tracee) -> i32 {
++        let status = crate::sys::ptrace(
++            crate::ptrace::ptc::PTRACE_GETREGS as u32,
++            tracee.pid,
++            0,
++            &mut tracee.regs[RegVersion::Current.idx()] as *mut _ as usize,
++        );
++        if status < 0 {
++            return status as i32;
++        }
++        0
++    }
++
++    /// Write the CURRENT bank back.  `including_sysnum` is a no-op on x86_64:
++    /// orig_rax is part of the register set pushed by PTRACE_SETREGS anyway.
++    pub(super) fn store_regs(tracee: &mut Tracee, _including_sysnum: bool) -> i32 {
++        let status = crate::sys::ptrace(
++            crate::ptrace::ptc::PTRACE_SETREGS as u32,
++            tracee.pid,
++            0,
++            &tracee.regs[RegVersion::Current.idx()] as *const _ as usize,
++        );
++        if status < 0 {
++            return status as i32;
++        }
++        0
++    }
+ }
+ 
+-const REG_OFFSET_X86_64: [usize; NB_REGS] = [
+-    reg_offset!(orig_rax), // SYSARG_NUM
+-    reg_offset!(rdi),      // SYSARG_1
+-    reg_offset!(rsi),      // SYSARG_2
+-    reg_offset!(rdx),      // SYSARG_3
+-    reg_offset!(r10),      // SYSARG_4
+-    reg_offset!(r8),       // SYSARG_5
+-    reg_offset!(r9),       // SYSARG_6
+-    reg_offset!(rax),      // SYSARG_RESULT
+-    reg_offset!(rsp),      // STACK_POINTER
+-    reg_offset!(rip),      // INSTR_POINTER
+-    reg_offset!(rdx),      // RTLD_FINI
+-    reg_offset!(eflags),   // STATE_FLAGS
+-    reg_offset!(rdi),      // USERARG_1
+-];
+-
+-/// Field offsets for the i386 ABI (32-bit syscall convention) as seen in a
+-/// `user_regs_struct` produced by a 64-bit kernel.
+-const REG_OFFSET_I386: [usize; NB_REGS] = [
+-    reg_offset!(orig_rax),
+-    reg_offset!(rbx),
+-    reg_offset!(rcx),
+-    reg_offset!(rdx),
+-    reg_offset!(rsi),
+-    reg_offset!(rdi),
+-    reg_offset!(rbp),
+-    reg_offset!(rax),
+-    reg_offset!(rsp),
+-    reg_offset!(rip),
+-    reg_offset!(rdx),
+-    reg_offset!(eflags),
+-    reg_offset!(rax),
+-];
++#[cfg(target_arch = "aarch64")]
++mod layout {
++    use super::{NB_REGS, RegVersion};
++    use crate::sysnum::Abi;
++    use crate::tracee::Tracee;
++
++    /// Cached general-purpose registers — `struct user_pt_regs` on aarch64,
++    /// read and written through PTRACE_{GET,SET}REGSET/NT_PRSTATUS.
++    ///
++    /// For an AArch32 (compat) task the kernel fills the first 72 bytes with
++    /// 18 32-bit words (r0..r15, cpsr, orig_r0) instead; `compat` records
++    /// which layout the bank holds.  It sits after the kernel-visible part,
++    /// which is all the regset transfers ever touch.
++    #[repr(C)]
++    #[derive(Copy, Clone, Debug, Default)]
++    pub struct Regs {
++        pub regs: [u64; 31],
++        pub sp: u64,
++        pub pc: u64,
++        pub pstate: u64,
++        pub compat: bool,
++    }
++
++    /// Size of `struct user_pt_regs`, the AArch64 NT_PRSTATUS payload.
++    const USER_PT_REGS_SIZE: usize = std::mem::offset_of!(Regs, compat);
++    /// Size of the AArch32 NT_PRSTATUS payload (`compat_elf_gregset_t`).
++    const COMPAT_REGS_SIZE: usize = 18 * 4;
++
++    const NT_PRSTATUS: usize = 1;
++    const NT_ARM_SYSTEM_CALL: usize = 0x404;
++
++    macro_rules! x {
++        ($n:expr) => {
++            std::mem::offset_of!(Regs, regs) + $n * 8
++        };
++    }
++
++    /// Offsets for the AArch64 syscall convention: number in x8, arguments
++    /// in x0..x5, result in x0.
++    pub(super) const REG_OFFSET_AARCH64: [usize; NB_REGS] = [
++        x!(8),                              // SYSARG_NUM
++        x!(0),                              // SYSARG_1
++        x!(1),                              // SYSARG_2
++        x!(2),                              // SYSARG_3
++        x!(3),                              // SYSARG_4
++        x!(4),                              // SYSARG_5
++        x!(5),                              // SYSARG_6
++        x!(0),                              // SYSARG_RESULT
++        std::mem::offset_of!(Regs, sp),     // STACK_POINTER
++        std::mem::offset_of!(Regs, pc),     // INSTR_POINTER
++        x!(0),                              // RTLD_FINI
++        std::mem::offset_of!(Regs, pstate), // STATE_FLAGS
++        x!(0),                              // USERARG_1
++    ];
++
++    /// Offsets for the ARM EABI convention inside a compat register dump:
++    /// number in r7, arguments in r0..r5, result in r0.
++    pub(super) const REG_OFFSET_ARM: [usize; NB_REGS] = [
++        7 * 4,  // SYSARG_NUM
++        0,      // SYSARG_1
++        4,      // SYSARG_2
++        2 * 4,  // SYSARG_3
++        3 * 4,  // SYSARG_4
++        4 * 4,  // SYSARG_5
++        5 * 4,  // SYSARG_6
++        0,      // SYSARG_RESULT
++        13 * 4, // STACK_POINTER
++        15 * 4, // INSTR_POINTER
++        0,      // RTLD_FINI
++        16 * 4, // STATE_FLAGS (cpsr)
++        0,      // USERARG_1
++    ];
++
++    /// Current ABI of the tracee: ORIGINAL regs, as on x86_64.
++    pub fn get_abi(tracee: &Tracee) -> Abi {
++        if tracee.regs[RegVersion::Original.idx()].compat {
++            Abi::Abi2
++        } else {
++            Abi::Default
++        }
++    }
++
++    /// Whether the tracee is an AArch32 process — CURRENT regs.
++    pub fn is_32on64_mode(tracee: &Tracee) -> bool {
++        tracee.regs[RegVersion::Current.idx()].compat
++    }
++
++    #[inline]
++    pub(super) fn reg_offsets(tracee: &Tracee, version: RegVersion) -> &'static [usize; NB_REGS] {
++        if tracee.regs[version.idx()].compat {
++            &REG_OFFSET_ARM
++        } else {
++            &REG_OFFSET_AARCH64
++        }
++    }
++
++    /// Slots are 32 bits wide in a compat dump, 64 bits otherwise.
++    #[inline]
++    pub(super) fn reg_width(regs: &Regs) -> usize {
++        if regs.compat { 4 } else { 8 }
++    }
++
++    fn regset(
++        tracee: &mut Tracee,
++        request: i32,
++        note: usize,
++        base: usize,
++        len: usize,
++    ) -> (i64, usize) {
++        let mut iov = libc::iovec {
++            iov_base: base as *mut libc::c_void,
++            iov_len: len,
++        };
++        let status = crate::sys::ptrace(
++            request as u32,
++            tracee.pid,
++            note,
++            &mut iov as *mut libc::iovec as usize,
++        );
++        (status, iov.iov_len)
++    }
++
++    /// `fetch_regs()` — refresh the CURRENT bank from the kernel.
++    pub fn fetch_regs(tracee: &mut Tracee) -> i32 {
++        let bank = &mut tracee.regs[RegVersion::Current.idx()] as *mut Regs as usize;
++        let (status, len) = regset(
++            tracee,
++            crate::ptrace::ptc::PTRACE_GETREGSET,
++            NT_PRSTATUS,
++            bank,
++            USER_PT_REGS_SIZE,
++        );
++        if status < 0 {
++            return status as i32;
++        }
++        tracee.regs[RegVersion::Current.idx()].compat = len == COMPAT_REGS_SIZE;
++        0
++    }
++
++    /// Write the CURRENT bank back.  The syscall number is not part of
++    /// NT_PRSTATUS on arm64: a dedicated NT_ARM_SYSTEM_CALL regset changes
++    /// it, and only while the tracee sits in a syscall stop.
++    pub(super) fn store_regs(tracee: &mut Tracee, including_sysnum: bool) -> i32 {
++        let current = tracee.regs[RegVersion::Current.idx()];
++        let sysnum_off = reg_offsets(tracee, RegVersion::Current)[super::Reg::SysargNum as usize];
++        let original_off =
++            reg_offsets(tracee, RegVersion::Original)[super::Reg::SysargNum as usize];
++        let current_sysnum = super::reg_read(&current, sysnum_off);
++        let original_sysnum =
++            super::reg_read(&tracee.regs[RegVersion::Original.idx()], original_off);
++
++        if including_sysnum && current_sysnum != original_sysnum {
++            // The kernel takes an `int`.
++            let mut sysnum = current_sysnum as i32;
++            let (status, _) = regset(
++                tracee,
++                crate::ptrace::ptc::PTRACE_SETREGSET,
++                NT_ARM_SYSTEM_CALL,
++                &mut sysnum as *mut i32 as usize,
++                std::mem::size_of::<i32>(),
++            );
++            if status < 0 {
++                return status as i32;
++            }
++        }
++
++        let len = if current.compat {
++            COMPAT_REGS_SIZE
++        } else {
++            USER_PT_REGS_SIZE
++        };
++        let bank = &tracee.regs[RegVersion::Current.idx()] as *const Regs as usize;
++        let (status, _) = regset(
++            tracee,
++            crate::ptrace::ptc::PTRACE_SETREGSET,
++            NT_PRSTATUS,
++            bank,
++            len,
++        );
++        if status < 0 {
++            return status as i32;
++        }
++        0
++    }
++}
++
++pub use layout::{Regs, fetch_regs, get_abi, is_32on64_mode};
++use layout::{reg_offsets, reg_width, store_regs};
+ 
+ /// SYSARG_1..SYSARG_6 by 1-based index (used by the chain machinery).
+ pub fn sysarg(index: usize) -> Reg {
+@@ -106,57 +383,31 @@ pub fn sysarg(index: usize) -> Reg {
+     }
+ }
+ 
+-/// Current ABI of the tracee (`get_abi()`): relies on ORIGINAL regs since an
+-/// ABI change takes effect only when the syscall fully returns.
+-pub fn get_abi(tracee: &Tracee) -> Abi {
+-    let cs = tracee.regs[RegVersion::Original.idx()].cs;
+-    match cs {
+-        0x23 => Abi::Abi2,
+-        0x33 => {
+-            if tracee.regs[RegVersion::Original.idx()].ds == 0x2B {
+-                Abi::Abi3
+-            } else {
+-                Abi::Default
+-            }
+-        }
+-        _ => Abi::Default,
+-    }
+-}
+-
+-/// Whether the tracee is a 32-bit process (x86 or x32) — CURRENT regs since
+-/// the mode switch is effective immediately.
+-pub fn is_32on64_mode(tracee: &Tracee) -> bool {
+-    let cs = tracee.regs[RegVersion::Current.idx()].cs;
+-    match cs {
+-        0x23 => true,
+-        0x33 => tracee.regs[RegVersion::Current.idx()].ds == 0x2B,
+-        _ => false,
+-    }
+-}
+-
+ /// Size of a guest word for the ABI currently in use.
+ pub fn sizeof_word(tracee: &Tracee) -> usize {
+     if is_32on64_mode(tracee) { 4 } else { 8 }
+ }
+ 
+-#[inline]
+-fn reg_offsets(tracee: &Tracee, version: RegVersion) -> &'static [usize; NB_REGS] {
+-    // i386 register conventions apply when cs == 0x23 for *that* bank.
+-    if tracee.regs[version.idx()].cs == 0x23 {
+-        &REG_OFFSET_I386
+-    } else {
+-        &REG_OFFSET_X86_64
+-    }
+-}
+-
+ fn reg_read(regs: &Regs, off: usize) -> u64 {
+-    crate::sys::as_bytes(regs)[off..off + 8]
+-        .try_into()
+-        .map(u64::from_ne_bytes)
+-        .unwrap_or(0)
++    let bytes = crate::sys::as_bytes(regs);
++    match reg_width(regs) {
++        4 => bytes[off..off + 4]
++            .try_into()
++            .map(|b| u32::from_ne_bytes(b) as u64)
++            .unwrap_or(0),
++        _ => bytes[off..off + 8]
++            .try_into()
++            .map(u64::from_ne_bytes)
++            .unwrap_or(0),
++    }
+ }
+ fn reg_write(regs: &mut Regs, off: usize, v: u64) {
+-    crate::sys::as_bytes_mut(regs)[off..off + 8].copy_from_slice(&v.to_ne_bytes());
++    let width = reg_width(regs);
++    let bytes = crate::sys::as_bytes_mut(regs);
++    match width {
++        4 => bytes[off..off + 4].copy_from_slice(&(v as u32).to_ne_bytes()),
++        _ => bytes[off..off + 8].copy_from_slice(&v.to_ne_bytes()),
++    }
+ }
+ 
+ /// `peek_reg()` — read the cached value of `reg` in `version`.
+@@ -187,20 +438,6 @@ pub fn save_current_regs(tracee: &mut Tracee, version: RegVersion) {
+     tracee.regs[version.idx()] = tracee.regs[RegVersion::Current.idx()];
+ }
+ 
+-/// `fetch_regs()` — refresh the CURRENT bank from the kernel.
+-pub fn fetch_regs(tracee: &mut Tracee) -> i32 {
+-    let status = crate::sys::ptrace(
+-        crate::ptrace::ptc::PTRACE_GETREGS as u32,
+-        tracee.pid,
+-        0,
+-        &mut tracee.regs[RegVersion::Current.idx()] as *mut _ as usize,
+-    );
+-    if status < 0 {
+-        return status as i32;
+-    }
+-    0
+-}
+-
+ /// `push_specific_regs()` — write back the CURRENT bank; optionally including
+ /// the syscall number (needed when PRoot rewrote it at sysenter).
+ pub fn push_specific_regs(tracee: &mut Tracee, including_sysnum: bool) -> i32 {
+@@ -214,8 +451,7 @@ pub fn push_specific_regs(tracee: &mut Tracee, including_sysnum: bool) -> i32 {
+             } else {
+                 RegVersion::Original
+             };
+-            // On x86_64 the sysarg regs never alias the result register; on
+-            // x32/i386 they don't either (result is rax).  Just restore all.
++            let result_off = reg_offsets(tracee, RegVersion::Current)[Reg::SysargResult as usize];
+             for r in [
+                 Reg::SysargNum,
+                 Reg::Sysarg1,
+@@ -228,21 +464,19 @@ pub fn push_specific_regs(tracee: &mut Tracee, including_sysnum: bool) -> i32 {
+             ] {
+                 let src_off = reg_offsets(tracee, from)[r as usize];
+                 let dst_off = reg_offsets(tracee, RegVersion::Current)[r as usize];
++                // Never restore a sysarg that aliases the result register
++                // (x0/r0 on ARM): that would clobber the syscall result.
++                // It never happens on x86, where the result is rax.
++                if dst_off == result_off {
++                    continue;
++                }
+                 let v = reg_read(&tracee.regs[from.idx()], src_off);
+                 reg_write(&mut tracee.regs[RegVersion::Current.idx()], dst_off, v);
+             }
+         }
+-        // including_sysnum is a no-op on x86_64: orig_rax is part of the
+-        // register set pushed by PTRACE_SETREGS anyway.
+-        let _ = including_sysnum;
+-        let status = crate::sys::ptrace(
+-            crate::ptrace::ptc::PTRACE_SETREGS as u32,
+-            tracee.pid,
+-            0,
+-            &tracee.regs[RegVersion::Current.idx()] as *const _ as usize,
+-        );
++        let status = store_regs(tracee, including_sysnum);
+         if status < 0 {
+-            return status as i32;
++            return status;
+         }
+     }
+     0
+@@ -287,13 +521,54 @@ pub fn print_current_regs(tracee: &Tracee, verbose_level: i32, message: &str) {
+     );
+ }
+ 
++/// Size of the instruction that trapped into the current syscall.
++#[cfg(target_arch = "x86_64")]
+ pub fn get_systrap_size(_tracee: &Tracee) -> Word {
+     crate::arch::SYSTRAP_SIZE
+ }
+ 
++/// Size of the instruction that trapped into the current syscall: `svc` is
++/// 2 bytes long when an AArch32 task runs in Thumb state (CPSR.T).
++#[cfg(target_arch = "aarch64")]
++pub fn get_systrap_size(tracee: &Tracee) -> Word {
++    const PSR_T_BIT: Word = 0x20;
++    if is_32on64_mode(tracee)
++        && peek_reg(tracee, RegVersion::Current, Reg::StateFlags) & PSR_T_BIT != 0
++    {
++        2
++    } else {
++        crate::arch::SYSTRAP_SIZE
++    }
++}
++
++/// Test helper: write `reg` straight into the `version` bank, without the
++/// dirty tracking `poke_reg` applies to CURRENT.
++#[cfg(test)]
++pub fn set_bank_reg(tracee: &mut Tracee, version: RegVersion, reg: Reg, value: Word) {
++    let off = reg_offsets(tracee, version)[reg as usize];
++    reg_write(&mut tracee.regs[version.idx()], off, value);
++}
++
++/// Test helper: make the `version` bank describe a native 64-bit task
++/// (`compat == false`) or a 32-bit compat one (i386 / AArch32).
+ #[cfg(test)]
++pub fn set_bank_compat(tracee: &mut Tracee, version: RegVersion, compat: bool) {
++    let regs = &mut tracee.regs[version.idx()];
++    #[cfg(target_arch = "x86_64")]
++    {
++        regs.cs = if compat { 0x23 } else { 0x33 };
++        regs.ds = 0;
++    }
++    #[cfg(target_arch = "aarch64")]
++    {
++        regs.compat = compat;
++    }
++}
++
++#[cfg(all(test, target_arch = "x86_64"))]
+ mod tests {
+     use super::*;
++    use crate::sysnum::Abi;
+ 
+     fn mk() -> Tracee {
+         Tracee::default()
+diff --git a/src/tracee/seccomp.rs b/src/tracee/seccomp.rs
+index aa613ce..16e1484 100644
+--- a/src/tracee/seccomp.rs
++++ b/src/tracee/seccomp.rs
+@@ -53,6 +53,7 @@ pub fn set_result_after_seccomp(tracee: &mut Tracee, result: Word) {
+ }
+ 
+ /// x86_64: `rax <- orig_rax` (resp. `eax <- orig_eax`); other archs no-op.
++#[cfg(target_arch = "x86_64")]
+ fn copy_orig_to_effective(tracee: &mut Tracee) {
+     // REG_OFFSET_X86_64: orig_rax (idx into Regs: 15), rax = SysargResult.
+     // Use the Reg abstraction: SYSARG_RESULT == rax slot; ORIG_RAX has no
+@@ -62,11 +63,20 @@ fn copy_orig_to_effective(tracee: &mut Tracee) {
+ }
+ 
+ /// x86_64: `orig_rax <- rax` after a rejected syscall (kernel set it to -1).
++#[cfg(target_arch = "x86_64")]
+ fn copy_effective_to_orig(tracee: &mut Tracee) {
+     let regs = &mut tracee.regs[RegVersion::Current.idx()];
+     regs.orig_rax = regs.rax;
+ }
+ 
++/// aarch64: the syscall number lives in x8 (r7 for AArch32), which the
++/// kernel leaves untouched when it rolls a trapped syscall back.
++#[cfg(not(target_arch = "x86_64"))]
++fn copy_orig_to_effective(_tracee: &mut Tracee) {}
++
++#[cfg(not(target_arch = "x86_64"))]
++fn copy_effective_to_orig(_tracee: &mut Tracee) {}
++
+ /// `handle_seccomp_event()` — SIGSYS raised by a system seccomp policy.
+ /// Returns 0 to swallow the signal, SIGSYS to deliver it.
+ pub fn handle_seccomp_event(tracee: &mut Tracee) -> i32 {
+@@ -642,8 +652,9 @@ fn statfs_via_sigsys(tracee: &mut Tracee) {
+         st.f_blocks,
+         st.f_bfree,
+         st.f_bavail,
+-        st.f_bsize as u64,
+-        st.f_frsize as u64,
++        // Field types vary between libc flavours (glibc vs Bionic).
++        st.f_bsize as _,
++        st.f_frsize as _,
+         st.f_files,
+         st.f_ffree,
+     ];
+@@ -657,8 +668,8 @@ fn statfs_via_sigsys(tracee: &mut Tracee) {
+     let put = |off: usize, v: i64, out: &mut [u8]| {
+         out[off..off + 4].copy_from_slice(&(v as i32).to_ne_bytes());
+     };
+-    put(0, f_type, &mut out);
+-    put(4, st.f_bsize, &mut out);
++    put(0, f_type as _, &mut out);
++    put(4, st.f_bsize as _, &mut out);
+     put(8, st.f_blocks as i64, &mut out);
+     put(12, st.f_bfree as i64, &mut out);
+     put(16, st.f_bavail as i64, &mut out);
+@@ -669,9 +680,9 @@ fn statfs_via_sigsys(tracee: &mut Tracee) {
+     let stb = crate::sys::as_bytes(&st);
+     let fsid_off = std::mem::offset_of!(libc::statfs64, f_fsid);
+     out[28..36].copy_from_slice(&stb[fsid_off..fsid_off + 8]);
+-    put(36, st.f_namelen, &mut out);
+-    put(40, st.f_frsize, &mut out);
+-    put(44, st.f_flags, &mut out);
++    put(36, st.f_namelen as _, &mut out);
++    put(40, st.f_frsize as _, &mut out);
++    put(44, st.f_flags as _, &mut out);
+ 
+     let _ = write_data(
+         tracee,
+@@ -717,6 +728,7 @@ mod tests {
+     use crate::tracee::reg::{Reg, RegVersion, peek_reg, poke_reg};
+ 
+     #[test]
++    #[cfg(target_arch = "x86_64")]
+     fn orig_effective_copy() {
+         let mut t = Tracee::default();
+         t.regs[RegVersion::Current.idx()].orig_rax = 0x1234;
+@@ -735,17 +747,21 @@ mod tests {
+             ..Default::default()
+         };
+         poke_reg(&mut t, Reg::InstrPointer, 0x1000);
+-        t.regs[RegVersion::Current.idx()].orig_rax = 42;
++        crate::tracee::reg::set_bank_reg(&mut t, RegVersion::Current, Reg::SysargNum, 42);
+         restart_syscall_after_seccomp(&mut t);
+-        // IP rewound by SYSTRAP_SIZE (syscall insn = 2 on x86_64).
++        // IP rewound by SYSTRAP_SIZE (syscall insn = 2 on x86_64, 4 on arm64).
+         assert_eq!(
+             peek_reg(&t, RegVersion::Current, Reg::InstrPointer),
+             0x1000 - crate::arch::SYSTRAP_SIZE
+         );
+         assert!(t.restore_original_regs_after_seccomp_event);
+         assert_eq!(t.restart_how, crate::ptrace::ptc::PTRACE_SYSCALL);
+-        // rax copied from orig_rax.
+-        assert_eq!(t.regs[RegVersion::Current.idx()].rax, 42);
++        // The re-executed trap reads the number back (x86_64: rax copied
++        // from orig_rax; aarch64: x8 untouched).
++        assert_eq!(
++            peek_reg(&t, RegVersion::Current, crate::tracee::reg::SYSTRAP_NUM),
++            42
++        );
+     }
+ 
+     #[test]
+diff --git a/src/tracee/statx.rs b/src/tracee/statx.rs
+index 3fd1a46..0b8cad9 100644
+--- a/src/tracee/statx.rs
++++ b/src/tracee/statx.rs
+@@ -207,8 +207,8 @@ pub fn handle_statx_syscall(tracee: &mut Tracee, from_sigsys: bool) -> i32 {
+             // stat() doesn't expose btime; ctime is the approximation.
+             state.statx_buf.stx_btime = statx_ts(sb.st_ctime, sb.st_ctime_nsec);
+         }
+-        state.statx_buf.stx_rdev_major = libc::major(sb.st_rdev);
+-        state.statx_buf.stx_rdev_minor = libc::minor(sb.st_rdev);
++        state.statx_buf.stx_rdev_major = libc::major(sb.st_rdev) as u32;
++        state.statx_buf.stx_rdev_minor = libc::minor(sb.st_rdev) as u32;
+         state.updated_stats = true;
+     } else {
+         // The kernel wrote the result; read it back so extensions can
