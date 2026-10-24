@@ -82,7 +82,7 @@ fun WorkspaceScreen(environments: List<Environment>, sessions: List<BoxSession>,
                         Spacer(Modifier.weight(1f))
                         FilledTonalButton({ onLaunch(env) }, enabled = !busy, contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)) { Icon(Icons.Rounded.Terminal, null, Modifier.size(16.dp)); Text(" Launch", fontSize = 12.sp) }
                     }
-                    if (env.packageManager == "dpkg") Text("This image includes dpkg and omits apt. Import .deb packages in Files, or use Debian for a ready-to-use apt environment.", fontSize = 11.sp, lineHeight = 17.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 10.dp))
+                    if (env.packageManager == "dpkg") Text("This environment was installed from an image without apt. Install a new environment to get apt, or import .deb packages in Files.", fontSize = 11.sp, lineHeight = 17.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 10.dp))
                 }
             }
         }

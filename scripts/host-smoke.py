@@ -42,8 +42,7 @@ for image in images:
                 "set -eu; test \"$(id -u)\" = 0; printf boxos > /root/probe; test \"$(cat /root/probe)\" = boxos; "
                 "mkdir /root/work; ln /root/probe /root/work/hardlink; test \"$(cat /root/work/hardlink)\" = boxos; "
                 "sh -c 'echo child-process-ok'; " +
-                ("/sbin/apk --version; " if image["distro"] == "alpine" else
-                 "if command -v apt >/dev/null; then apt --version; else dpkg --version; echo 'Image capability: dpkg only (apt omitted upstream)'; fi; ") +
+                ("/sbin/apk --version; " if image["distro"] == "alpine" else "apt-get --version; ") +
                 "uname -m; echo BOXOS_SMOKE_OK"]
         result = subprocess.run(args, text=True, capture_output=True, timeout=60)
         print(result.stdout, flush=True)
