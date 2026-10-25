@@ -14,6 +14,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -89,7 +90,8 @@ fun TerminalScreen(app: BoxApp, preferences: Preferences, onNew: () -> Unit, fon
                         requestFocus()
                         view = this
                     } },
-                    modifier = Modifier.fillMaxWidth().weight(1f).background(Color(0xFF10130F)),
+                    // TerminalView renders at least four rows, even when it is given less height.
+                    modifier = Modifier.fillMaxWidth().weight(1f).clipToBounds().background(Color(0xFF10130F)),
                     update = { terminalView ->
                         if (terminalView.tag != preferences.fontSize) {
                             terminalView.setTextSize((preferences.fontSize * terminalView.resources.displayMetrics.scaledDensity).toInt())

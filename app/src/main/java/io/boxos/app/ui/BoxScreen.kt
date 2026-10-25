@@ -68,7 +68,8 @@ fun BoxScreen(app: BoxApp, requestNotifications: () -> Unit) {
             }
         }
     ) { padding ->
-        Column(Modifier.fillMaxSize().padding(padding).imePadding(), horizontalAlignment = Alignment.CenterHorizontally) {
+        // The bottom bar padding is already applied; only the IME height beyond it remains.
+        Column(Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding).imePadding(), horizontalAlignment = Alignment.CenterHorizontally) {
             operation?.let { operation ->
                 Surface(Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.primaryContainer) {
                     Column(Modifier.padding(horizontal = 20.dp, vertical = 10.dp)) {
