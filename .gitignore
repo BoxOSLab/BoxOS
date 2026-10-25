@@ -7,3 +7,4 @@ local.properties
 vendor/boxkernel/target/
 app/src/main/jniLibs/
 artifacts/
+__pycache__/
